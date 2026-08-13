@@ -1,0 +1,20 @@
+{
+  "name": "vendabot-bot",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp (Baileys) do VendaBot — lê produtos, grupos e horários do Supabase e dispara ofertas automaticamente.",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "@supabase/supabase-js": "^2.45.4",
+    "qrcode-terminal": "^0.12.0",
+    "node-schedule": "^2.1.1",
+    "pino": "^9.4.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
