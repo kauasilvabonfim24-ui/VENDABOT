@@ -1,29 +1,41 @@
 // ╔══════════════════════════════════════════════════════╗
-// ║   BOT VENDABOT — Agente IA + Supabase                ║
+// ║   BOT VENDABOT — Multi-tenant (várias conexões)      ║
 // ╚══════════════════════════════════════════════════════╝
-// npm install @whiskeysockets/baileys qrcode-terminal node-schedule pino @supabase/supabase-js dotenv
+// npm install @whiskeysockets/baileys qrcode-terminal qrcode node-schedule pino @supabase/supabase-js dotenv
 
 require('dotenv').config();
 const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const schedule = require('node-schedule');
 const { createClient } = require('@supabase/supabase-js');
 const agente = require('./agente');
 
-// ID da sessão — no futuro (multi-tenant), cada usuário terá o seu próprio.
-// Por enquanto, um valor fixo (pode trocar via variável de ambiente SESSION_ID).
-const SESSION_ID = process.env.SESSION_ID || 'default';
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+  console.error('❌ Faltando SUPABASE_URL ou SUPABASE_SERVICE_KEY no .env / variáveis de ambiente.');
+  process.exit(1);
+}
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ─── SESSÃO DO WHATSAPP GUARDADA NO SUPABASE ────────────────────────────────
-// Substitui o useMultiFileAuthState (que salva em pasta local) por uma versão
-// que salva na tabela bot_auth_state. Assim a sessão sobrevive a reinícios
-// no Render, onde o disco não é permanente.
-async function useSupabaseAuthState(supabase, sessionId) {
+// ─── ESTADO EM MEMÓRIA (por processo) ────────────────────────────────────────
+const sockets = new Map();       // user_id -> socket Baileys ativo
+const jobsPorUsuario = new Map(); // user_id -> array de jobs agendados
+
+// ─── SERVIDOR HTTP MÍNIMO (satisfaz o Health Check do Render) ───────────────
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end(`VendaBot multi-tenant — ${sockets.size} usuário(s) conectado(s)`);
+}).listen(PORT, () => console.log(`🌐 Servidor HTTP ouvindo na porta ${PORT}`));
+
+// ─── SESSÃO DO WHATSAPP GUARDADA NO SUPABASE (agora por usuário) ────────────
+async function useSupabaseAuthState(userId) {
   const writeData = async (key, data) => {
     const value = JSON.stringify(data, BufferJSON.replacer);
     await supabase.from('bot_auth_state').upsert({
-      id: `${sessionId}:${key}`,
+      user_id: userId,
+      key,
       data: value,
       updated_at: new Date().toISOString()
     });
@@ -33,7 +45,8 @@ async function useSupabaseAuthState(supabase, sessionId) {
     const { data, error } = await supabase
       .from('bot_auth_state')
       .select('data')
-      .eq('id', `${sessionId}:${key}`)
+      .eq('user_id', userId)
+      .eq('key', key)
       .maybeSingle();
     if (error || !data) return null;
     try {
@@ -44,7 +57,7 @@ async function useSupabaseAuthState(supabase, sessionId) {
   };
 
   const removeData = async (key) => {
-    await supabase.from('bot_auth_state').delete().eq('id', `${sessionId}:${key}`);
+    await supabase.from('bot_auth_state').delete().eq('user_id', userId).eq('key', key);
   };
 
   const creds = (await readData('creds')) || initAuthCreds();
@@ -81,70 +94,30 @@ async function useSupabaseAuthState(supabase, sessionId) {
   };
 }
 
-// ─── SUPABASE ─────────────────────────────────────────────────────────────
-// SUPABASE_URL e SUPABASE_SERVICE_KEY vêm de variáveis de ambiente (.env local
-// ou configuradas direto no Render). SUPABASE_SERVICE_KEY é a chave "service_role"
-// (ou sb_secret_...) — ela ignora RLS, por isso NUNCA deve ir pro GitHub.
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-  console.error('❌ Faltando SUPABASE_URL ou SUPABASE_SERVICE_KEY no .env / variáveis de ambiente.');
-  process.exit(1);
-}
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-
-// ─── SERVIDOR HTTP MÍNIMO ────────────────────────────────────────────────────
-// O Render (plano Web Service) espera que o app abra uma porta pra considerar
-// o deploy "no ar". O bot em si não precisa disso pra funcionar, é só pra
-// evitar que o Render reinicie o serviço achando que ele travou.
-const http = require('http');
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end(botConectado ? 'VendaBot: conectado ✅' : 'VendaBot: iniciando...');
-}).listen(PORT, () => console.log(`🌐 Servidor HTTP ouvindo na porta ${PORT}`));
-
-let sock;
-let jobsAtivos = [];
-let botConectado = false;
-
-// ─── LER CONFIG DO SUPABASE ─────────────────────────────────────────────────
-// Converte os nomes de coluna do banco (snake_case) pros nomes que o
-// agente.js já espera (camelCase), pra não precisar mexer no agente.js.
-async function lerConfig() {
+// ─── LER CONFIG DE UM USUÁRIO ESPECÍFICO ────────────────────────────────────
+async function lerConfigUsuario(userId) {
   const [{ data: productsRaw, error: e1 }, { data: groupsRaw, error: e2 }, { data: schedulesRaw, error: e3 }] =
     await Promise.all([
-      supabase.from('products').select('*'),
-      supabase.from('groups').select('*'),
-      supabase.from('schedules').select('*')
+      supabase.from('products').select('*').eq('user_id', userId),
+      supabase.from('groups').select('*').eq('user_id', userId),
+      supabase.from('schedules').select('*').eq('user_id', userId)
     ]);
 
   if (e1 || e2 || e3) {
-    console.error('❌ Erro ao ler do Supabase:', (e1 || e2 || e3).message);
+    console.error(`❌ [${userId}] Erro ao ler do Supabase:`, (e1 || e2 || e3).message);
     return { products: [], groups: [], schedules: [] };
   }
 
   const products = (productsRaw || []).map(p => ({
-    id: p.id,
-    name: p.name,
-    oldPrice: p.old_price,
-    price: p.price,
-    link: p.link,
-    imageUrl: p.image_url,
-    category: p.category
+    id: p.id, name: p.name, oldPrice: p.old_price, price: p.price,
+    link: p.link, imageUrl: p.image_url, category: p.category
   }));
-
   const groups = (groupsRaw || []).map(g => ({
-    id: g.id,
-    name: g.name,
-    gid: g.whatsapp_gid,
-    role: g.role
+    id: g.id, name: g.name, gid: g.whatsapp_gid, role: g.role
   }));
-
   const schedules = (schedulesRaw || []).map(s => ({
-    id: s.id,
-    time: s.time,
-    repeat: s.repeat,
-    groupIds: s.group_ids || [],
-    categoria: s.category || null
+    id: s.id, time: s.time, repeat: s.repeat,
+    groupIds: s.group_ids || [], categoria: s.category || null
   }));
 
   return { products, groups, schedules };
@@ -159,7 +132,7 @@ function resolverGrupos(ag, config) {
   return ids;
 }
 
-async function enviarMensagem(jid, texto, imageUrl, tentativas = 3) {
+async function enviarMensagem(sock, jid, texto, imageUrl, tentativas = 3) {
   for (let i = 1; i <= tentativas; i++) {
     try {
       if (imageUrl && imageUrl.startsWith('http')) {
@@ -176,35 +149,25 @@ async function enviarMensagem(jid, texto, imageUrl, tentativas = 3) {
   return false;
 }
 
-function cancelarJobs() {
-  jobsAtivos.forEach(j => j.job.cancel());
-  jobsAtivos = [];
+function cancelarJobsUsuario(userId) {
+  const jobs = jobsPorUsuario.get(userId) || [];
+  jobs.forEach(j => j.job.cancel());
+  jobsPorUsuario.set(userId, []);
 }
 
-async function agendarMensagens() {
-  cancelarJobs();
-  const config = await lerConfig();
+// ─── AGENDAR MENSAGENS DE UM USUÁRIO ────────────────────────────────────────
+async function agendarMensagensUsuario(userId) {
+  cancelarJobsUsuario(userId);
+  const config = await lerConfigUsuario(userId);
+  const novosJobs = [];
 
-  console.log('\n──────────────────────────────────────');
-  console.log(`📦 Produtos: ${config.products.length}`);
-  console.log(`👥 Grupos: ${config.groups.length}`);
-  console.log(`⏰ Horários agendados: ${config.schedules.length}`);
-  console.log('──────────────────────────────────────\n');
-
-  if (!config.schedules.length) {
-    console.log('📭 Nenhum horário agendado ainda.\n');
-    return;
-  }
+  if (!config.schedules.length) return;
 
   config.schedules.forEach(ag => {
     if (!ag.time) return;
     const [hora, minuto] = ag.time.split(':').map(Number);
     const grupoIds = resolverGrupos(ag, config);
-
-    if (!grupoIds.length) {
-      console.log(`❌ Horário ${ag.time} sem grupos válidos`);
-      return;
-    }
+    if (!grupoIds.length) return;
 
     const rule = new schedule.RecurrenceRule();
     if (ag.repeat === 'weekdays') rule.dayOfWeek = [1, 2, 3, 4, 5];
@@ -214,141 +177,143 @@ async function agendarMensagens() {
     rule.tz = 'America/Sao_Paulo';
 
     const job = schedule.scheduleJob(rule, async () => {
-      console.log(`\n⏰⏰⏰ DISPARANDO [${ag.time}] ⏰⏰⏰`);
-
-      if (!botConectado) {
-        console.log('❌ Bot desconectado! Mensagem não enviada.');
+      const sock = sockets.get(userId);
+      if (!sock) {
+        console.log(`❌ [${userId}] Bot desconectado! Mensagem não enviada.`);
         return;
       }
 
-      const configAtual = await lerConfig();
+      const configAtual = await lerConfigUsuario(userId);
       const categoriaForcada = ag.categoria || null;
       const grupos = resolverGrupos(ag, configAtual);
-      console.log(`📍 Enviando para ${grupos.length} grupo(s)`);
 
-      let sucesso = 0, falha = 0;
       for (const id of grupos) {
         const grupoInfo = (configAtual.groups || []).find(g => g.gid === id);
         const nomeGrupoAtual = grupoInfo ? grupoInfo.name : '';
         const grupoIdAtual = grupoInfo ? String(grupoInfo.id) : id;
 
         const resultado = agente.gerarParaGrupo(configAtual.products, hora, nomeGrupoAtual, grupoIdAtual, categoriaForcada);
-        if (!resultado) { console.log(`   ⚠️  Sem produto para: ${nomeGrupoAtual}`); falha++; continue; }
+        if (!resultado) continue;
 
-        console.log(`   📝 "${resultado.mensagem.substring(0, 60)}..."`);
-        const ok = await enviarMensagem(id, resultado.mensagem, resultado.imageUrl);
-        if (ok) { console.log(`   ✅ Enviado: ${nomeGrupoAtual}`); sucesso++; }
-        else { console.log(`   ❌ Falhou: ${nomeGrupoAtual}`); falha++; }
+        const ok = await enviarMensagem(sock, id, resultado.mensagem, resultado.imageUrl);
+        console.log(`   [${userId}] ${ok ? '✅ Enviado' : '❌ Falhou'}: ${nomeGrupoAtual}`);
         await new Promise(r => setTimeout(r, 4000));
       }
-      console.log(`\n📊 Resultado: ${sucesso} enviado(s), ${falha} falhou\n`);
     });
 
-    if (job) {
-      jobsAtivos.push({ job, time: ag.time });
-      console.log(`✅ Horário ativo: ${ag.time} → ${grupoIds.length} grupo(s) → Agente escolhe o produto`);
-    }
+    if (job) novosJobs.push({ job, time: ag.time });
   });
 
-  console.log(`\n🟢 TOTAL DE HORÁRIOS ATIVOS: ${jobsAtivos.length}`);
-  console.log('🧠 Agente IA vai escolher e gerar as copys automaticamente!\n');
+  jobsPorUsuario.set(userId, novosJobs);
+  console.log(`⏰ [${userId}] ${novosJobs.length} horário(s) ativo(s)`);
 }
 
-// ─── MONITORAR MUDANÇAS EM TEMPO REAL (Supabase Realtime) ──────────────────
-// Em vez de checar um arquivo local a cada X segundos (como era com o
-// config.json), o bot escuta mudanças nas 3 tabelas via Realtime e
-// reagenda automaticamente quando algo muda.
-function monitorarConfig() {
-  const canal = supabase
-    .channel('vendabot-config-changes')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, recarregar)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, recarregar)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, recarregar)
-    .subscribe((status, err) => {
-      console.log(`📡 Status do canal Realtime: ${status}`);
-      if (err) console.error('📡 Erro do Realtime:', err.message || err);
-    });
+// ─── INICIAR CONEXÃO DE UM USUÁRIO ──────────────────────────────────────────
+async function iniciarConexaoUsuario(userId) {
+  if (sockets.has(userId)) return; // já conectado ou conectando
 
-  console.log('👁️  Monitorando Supabase em tempo real — atualização automática ativa!\n');
-
-  async function recarregar() {
-    console.log('\n🔄 Mudança detectada no Supabase! Recarregando...');
-    await agendarMensagens();
-  }
-}
-
-async function conectar() {
-  const { state, saveCreds } = await useSupabaseAuthState(supabase, SESSION_ID);
-  sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: require('pino')({ level: 'silent' }) });
+  console.log(`\n🔌 [${userId}] Iniciando conexão...`);
+  const { state, saveCreds } = await useSupabaseAuthState(userId);
+  const sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: require('pino')({ level: 'silent' }) });
+  sockets.set(userId, sock);
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
     if (qr) {
-      console.log('\n📱 Escaneie o QR Code:\n');
-      qrcode.generate(qr, { small: true });
+      console.log(`📱 [${userId}] QR Code gerado.`);
+      qrcodeTerminal.generate(qr, { small: true });
       try {
         const qrImage = await QRCode.toDataURL(qr);
         await supabase.from('bot_status').upsert({
-          session_id: SESSION_ID,
-          status: 'qr',
-          qr_code: qrImage,
-          updated_at: new Date().toISOString()
+          user_id: userId, status: 'qr', qr_code: qrImage, updated_at: new Date().toISOString()
         });
-        console.log('💾 QR Code salvo no Supabase pro painel exibir.');
       } catch (e) {
-        console.error('❌ Erro ao salvar QR no Supabase:', e.message);
+        console.error(`❌ [${userId}] Erro ao salvar QR:`, e.message);
       }
     }
+
     if (connection === 'open') {
-      botConectado = true;
-      console.log('\n✅✅✅ BOT CONECTADO! ✅✅✅\n');
+      console.log(`✅ [${userId}] CONECTADO!`);
       await supabase.from('bot_status').upsert({
-        session_id: SESSION_ID,
-        status: 'connected',
-        qr_code: null,
-        updated_at: new Date().toISOString()
+        user_id: userId, status: 'connected', qr_code: null, updated_at: new Date().toISOString()
       });
       setTimeout(async () => {
         try {
           const grupos = await sock.groupFetchAllParticipating();
-          const listaGrupos = Object.entries(grupos);
-          console.log('📋 Seus grupos:');
-          listaGrupos.forEach(([id, g]) => console.log(`   "${g.subject}" → ${id}`));
-          console.log('');
-
-          // Salva a lista no Supabase pro painel mostrar num seletor
-          const registros = listaGrupos.map(([id, g]) => ({
-            session_id: SESSION_ID,
-            gid: id,
-            name: g.subject,
-            updated_at: new Date().toISOString()
+          const registros = Object.entries(grupos).map(([id, g]) => ({
+            user_id: userId, gid: id, name: g.subject, updated_at: new Date().toISOString()
           }));
-          if (registros.length) {
-            const { error } = await supabase.from('whatsapp_groups_available').upsert(registros);
-            if (error) console.error('❌ Erro ao salvar grupos disponíveis:', error.message);
-            else console.log(`💾 ${registros.length} grupo(s) salvo(s) no Supabase.`);
-          }
+          if (registros.length) await supabase.from('whatsapp_groups_available').upsert(registros);
+          console.log(`💾 [${userId}] ${registros.length} grupo(s) salvo(s).`);
         } catch (e) {}
-        await agendarMensagens();
-        monitorarConfig();
+        await agendarMensagensUsuario(userId);
       }, 3000);
     }
+
     if (connection === 'close') {
-      botConectado = false;
+      sockets.delete(userId);
+      cancelarJobsUsuario(userId);
+      const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
       await supabase.from('bot_status').upsert({
-        session_id: SESSION_ID,
-        status: 'disconnected',
-        updated_at: new Date().toISOString()
+        user_id: userId, status: 'disconnected', qr_code: null, updated_at: new Date().toISOString()
       });
-      const ok = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (ok) { console.log('🔄 Reconectando...'); setTimeout(conectar, 5000); }
-      else console.log(`❌ Sessão encerrada. Apague as linhas com id começando em "${SESSION_ID}:" na tabela bot_auth_state e rode novamente.`);
+      if (!deslogado) {
+        console.log(`🔄 [${userId}] Reconectando em 5s...`);
+        setTimeout(() => iniciarConexaoUsuario(userId), 5000);
+      } else {
+        console.log(`❌ [${userId}] Sessão encerrada (logout). Precisa reconectar via painel.`);
+      }
     }
   });
+
   sock.ev.on('creds.update', saveCreds);
+}
+
+// ─── ESCUTAR PEDIDOS DE CONEXÃO E MUDANÇAS DE CONFIG ────────────────────────
+function monitorarSupabase() {
+  supabase
+    .channel('vendabot-bot-status')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_status' }, (payload) => {
+      const row = payload.new;
+      if (row && row.status === 'requested' && !sockets.has(row.user_id)) {
+        iniciarConexaoUsuario(row.user_id);
+      }
+    })
+    .subscribe((status) => console.log(`📡 [bot_status] Realtime: ${status}`));
+
+  supabase
+    .channel('vendabot-config-changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, (p) => recarregarUsuario(p))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, (p) => recarregarUsuario(p))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, (p) => recarregarUsuario(p))
+    .subscribe((status) => console.log(`📡 [config] Realtime: ${status}`));
+
+  function recarregarUsuario(payload) {
+    const userId = (payload.new && payload.new.user_id) || (payload.old && payload.old.user_id);
+    if (userId && sockets.has(userId)) {
+      console.log(`🔄 [${userId}] Config mudou, reagendando...`);
+      agendarMensagensUsuario(userId);
+    }
+  }
+}
+
+// ─── AO LIGAR: RECONECTA AUTOMATICAMENTE QUEM JÁ ESTAVA CONECTADO ───────────
+async function reconectarUsuariosExistentes() {
+  const { data, error } = await supabase
+    .from('bot_status')
+    .select('user_id')
+    .in('status', ['connected', 'qr', 'requested']);
+
+  if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
+
+  for (const row of data || []) {
+    await iniciarConexaoUsuario(row.user_id);
+  }
+  console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
 }
 
 process.on('uncaughtException', e => console.error('🔴 ERRO:', e.message));
 process.on('unhandledRejection', e => console.error('🔴 ERRO PROMISE:', e.message || e));
 
-console.log('🤖 VendaBot + Agente IA iniciando...\n');
-conectar();
+console.log('🤖 VendaBot multi-tenant iniciando...\n');
+monitorarSupabase();
+reconectarUsuariosExistentes();
