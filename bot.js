@@ -309,9 +309,23 @@ async function conectar() {
       setTimeout(async () => {
         try {
           const grupos = await sock.groupFetchAllParticipating();
+          const listaGrupos = Object.entries(grupos);
           console.log('📋 Seus grupos:');
-          Object.entries(grupos).forEach(([id, g]) => console.log(`   "${g.subject}" → ${id}`));
+          listaGrupos.forEach(([id, g]) => console.log(`   "${g.subject}" → ${id}`));
           console.log('');
+
+          // Salva a lista no Supabase pro painel mostrar num seletor
+          const registros = listaGrupos.map(([id, g]) => ({
+            session_id: SESSION_ID,
+            gid: id,
+            name: g.subject,
+            updated_at: new Date().toISOString()
+          }));
+          if (registros.length) {
+            const { error } = await supabase.from('whatsapp_groups_available').upsert(registros);
+            if (error) console.error('❌ Erro ao salvar grupos disponíveis:', error.message);
+            else console.log(`💾 ${registros.length} grupo(s) salvo(s) no Supabase.`);
+          }
         } catch (e) {}
         await agendarMensagens();
         monitorarConfig();
