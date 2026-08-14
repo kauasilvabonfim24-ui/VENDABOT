@@ -4,16 +4,76 @@
 // npm install @whiskeysockets/baileys qrcode-terminal node-schedule pino @supabase/supabase-js dotenv
 
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const schedule = require('node-schedule');
 const { createClient } = require('@supabase/supabase-js');
 const agente = require('./agente');
 
-// ─── SUPABASE ─────────────────────────────────────────────────────────────
-// SUPABASE_URL e SUPABASE_SERVICE_KEY vêm de variáveis de ambiente (.env local
-// ou configuradas direto no Render). SUPABASE_SERVICE_KEY é a chave "service_role"
-// (ou sb_secret_...) — ela ignora RLS, por isso NUNCA deve ir pro GitHub.
+const SESSION_ID = process.env.SESSION_ID || 'default';
+
+async function useSupabaseAuthState(supabase, sessionId) {
+  const writeData = async (key, data) => {
+    const value = JSON.stringify(data, BufferJSON.replacer);
+    await supabase.from('bot_auth_state').upsert({
+      id: `${sessionId}:${key}`,
+      data: value,
+      updated_at: new Date().toISOString()
+    });
+  };
+
+  const readData = async (key) => {
+    const { data, error } = await supabase
+      .from('bot_auth_state')
+      .select('data')
+      .eq('id', `${sessionId}:${key}`)
+      .maybeSingle();
+    if (error || !data) return null;
+    try {
+      return JSON.parse(data.data, BufferJSON.reviver);
+    } catch {
+      return null;
+    }
+  };
+
+  const removeData = async (key) => {
+    await supabase.from('bot_auth_state').delete().eq('id', `${sessionId}:${key}`);
+  };
+
+  const creds = (await readData('creds')) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          await Promise.all(ids.map(async (id) => {
+            let value = await readData(`${type}-${id}`);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }));
+          return data;
+        },
+        set: async (data) => {
+          const tasks = [];
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              tasks.push(value ? writeData(key, value) : removeData(key));
+            }
+          }
+          await Promise.all(tasks);
+        }
+      }
+    },
+    saveCreds: () => writeData('creds', creds)
+  };
+}
+
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
   console.error('❌ Faltando SUPABASE_URL ou SUPABASE_SERVICE_KEY no .env / variáveis de ambiente.');
   process.exit(1);
@@ -24,9 +84,6 @@ let sock;
 let jobsAtivos = [];
 let botConectado = false;
 
-// ─── LER CONFIG DO SUPABASE ─────────────────────────────────────────────────
-// Converte os nomes de coluna do banco (snake_case) pros nomes que o
-// agente.js já espera (camelCase), pra não precisar mexer no agente.js.
 async function lerConfig() {
   const [{ data: productsRaw, error: e1 }, { data: groupsRaw, error: e2 }, { data: schedulesRaw, error: e3 }] =
     await Promise.all([
@@ -171,17 +228,16 @@ async function agendarMensagens() {
   console.log('🧠 Agente IA vai escolher e gerar as copys automaticamente!\n');
 }
 
-// ─── MONITORAR MUDANÇAS EM TEMPO REAL (Supabase Realtime) ──────────────────
-// Em vez de checar um arquivo local a cada X segundos (como era com o
-// config.json), o bot escuta mudanças nas 3 tabelas via Realtime e
-// reagenda automaticamente quando algo muda.
 function monitorarConfig() {
   const canal = supabase
     .channel('vendabot-config-changes')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, recarregar)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, recarregar)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, recarregar)
-    .subscribe();
+    .subscribe((status, err) => {
+      console.log(`📡 Status do canal Realtime: ${status}`);
+      if (err) console.error('📡 Erro do Realtime:', err.message || err);
+    });
 
   console.log('👁️  Monitorando Supabase em tempo real — atualização automática ativa!\n');
 
@@ -192,7 +248,7 @@ function monitorarConfig() {
 }
 
 async function conectar() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth');
+  const { state, saveCreds } = await useSupabaseAuthState(supabase, SESSION_ID);
   sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: require('pino')({ level: 'silent' }) });
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
@@ -215,7 +271,7 @@ async function conectar() {
       botConectado = false;
       const ok = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       if (ok) { console.log('🔄 Reconectando...'); setTimeout(conectar, 5000); }
-      else console.log('❌ Sessão encerrada. Delete a pasta auth e rode novamente.');
+      else console.log(`❌ Sessão encerrada. Apague as linhas com id começando em "${SESSION_ID}:" na tabela bot_auth_state e rode novamente.`);
     }
   });
   sock.ev.on('creds.update', saveCreds);
