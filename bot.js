@@ -10,8 +10,14 @@ const schedule = require('node-schedule');
 const { createClient } = require('@supabase/supabase-js');
 const agente = require('./agente');
 
+// ID da sessão — no futuro (multi-tenant), cada usuário terá o seu próprio.
+// Por enquanto, um valor fixo (pode trocar via variável de ambiente SESSION_ID).
 const SESSION_ID = process.env.SESSION_ID || 'default';
 
+// ─── SESSÃO DO WHATSAPP GUARDADA NO SUPABASE ────────────────────────────────
+// Substitui o useMultiFileAuthState (que salva em pasta local) por uma versão
+// que salva na tabela bot_auth_state. Assim a sessão sobrevive a reinícios
+// no Render, onde o disco não é permanente.
 async function useSupabaseAuthState(supabase, sessionId) {
   const writeData = async (key, data) => {
     const value = JSON.stringify(data, BufferJSON.replacer);
@@ -74,16 +80,34 @@ async function useSupabaseAuthState(supabase, sessionId) {
   };
 }
 
+// ─── SUPABASE ─────────────────────────────────────────────────────────────
+// SUPABASE_URL e SUPABASE_SERVICE_KEY vêm de variáveis de ambiente (.env local
+// ou configuradas direto no Render). SUPABASE_SERVICE_KEY é a chave "service_role"
+// (ou sb_secret_...) — ela ignora RLS, por isso NUNCA deve ir pro GitHub.
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
   console.error('❌ Faltando SUPABASE_URL ou SUPABASE_SERVICE_KEY no .env / variáveis de ambiente.');
   process.exit(1);
 }
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
+// ─── SERVIDOR HTTP MÍNIMO ────────────────────────────────────────────────────
+// O Render (plano Web Service) espera que o app abra uma porta pra considerar
+// o deploy "no ar". O bot em si não precisa disso pra funcionar, é só pra
+// evitar que o Render reinicie o serviço achando que ele travou.
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end(botConectado ? 'VendaBot: conectado ✅' : 'VendaBot: iniciando...');
+}).listen(PORT, () => console.log(`🌐 Servidor HTTP ouvindo na porta ${PORT}`));
+
 let sock;
 let jobsAtivos = [];
 let botConectado = false;
 
+// ─── LER CONFIG DO SUPABASE ─────────────────────────────────────────────────
+// Converte os nomes de coluna do banco (snake_case) pros nomes que o
+// agente.js já espera (camelCase), pra não precisar mexer no agente.js.
 async function lerConfig() {
   const [{ data: productsRaw, error: e1 }, { data: groupsRaw, error: e2 }, { data: schedulesRaw, error: e3 }] =
     await Promise.all([
@@ -228,6 +252,10 @@ async function agendarMensagens() {
   console.log('🧠 Agente IA vai escolher e gerar as copys automaticamente!\n');
 }
 
+// ─── MONITORAR MUDANÇAS EM TEMPO REAL (Supabase Realtime) ──────────────────
+// Em vez de checar um arquivo local a cada X segundos (como era com o
+// config.json), o bot escuta mudanças nas 3 tabelas via Realtime e
+// reagenda automaticamente quando algo muda.
 function monitorarConfig() {
   const canal = supabase
     .channel('vendabot-config-changes')
