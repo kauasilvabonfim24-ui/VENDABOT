@@ -6,6 +6,7 @@
 require('dotenv').config();
 const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const schedule = require('node-schedule');
 const { createClient } = require('@supabase/supabase-js');
 const agente = require('./agente');
@@ -280,10 +281,31 @@ async function conectar() {
   sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: require('pino')({ level: 'silent' }) });
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    if (qr) { console.log('\n📱 Escaneie o QR Code:\n'); qrcode.generate(qr, { small: true }); }
+    if (qr) {
+      console.log('\n📱 Escaneie o QR Code:\n');
+      qrcode.generate(qr, { small: true });
+      try {
+        const qrImage = await QRCode.toDataURL(qr);
+        await supabase.from('bot_status').upsert({
+          session_id: SESSION_ID,
+          status: 'qr',
+          qr_code: qrImage,
+          updated_at: new Date().toISOString()
+        });
+        console.log('💾 QR Code salvo no Supabase pro painel exibir.');
+      } catch (e) {
+        console.error('❌ Erro ao salvar QR no Supabase:', e.message);
+      }
+    }
     if (connection === 'open') {
       botConectado = true;
       console.log('\n✅✅✅ BOT CONECTADO! ✅✅✅\n');
+      await supabase.from('bot_status').upsert({
+        session_id: SESSION_ID,
+        status: 'connected',
+        qr_code: null,
+        updated_at: new Date().toISOString()
+      });
       setTimeout(async () => {
         try {
           const grupos = await sock.groupFetchAllParticipating();
@@ -297,6 +319,11 @@ async function conectar() {
     }
     if (connection === 'close') {
       botConectado = false;
+      await supabase.from('bot_status').upsert({
+        session_id: SESSION_ID,
+        status: 'disconnected',
+        updated_at: new Date().toISOString()
+      });
       const ok = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       if (ok) { console.log('🔄 Reconectando...'); setTimeout(conectar, 5000); }
       else console.log(`❌ Sessão encerrada. Apague as linhas com id começando em "${SESSION_ID}:" na tabela bot_auth_state e rode novamente.`);
