@@ -211,6 +211,7 @@ async function agendarMensagens() {
     rule.hour = hora;
     rule.minute = minuto;
     rule.second = 0;
+    rule.tz = 'America/Sao_Paulo';
 
     const job = schedule.scheduleJob(rule, async () => {
       console.log(`\n⏰⏰⏰ DISPARANDO [${ag.time}] ⏰⏰⏰`);
