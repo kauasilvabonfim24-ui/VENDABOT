@@ -10,6 +10,7 @@
     "@whiskeysockets/baileys": "^6.7.9",
     "@supabase/supabase-js": "^2.45.4",
     "qrcode-terminal": "^0.12.0",
+    "qrcode": "^1.5.3",
     "node-schedule": "^2.1.1",
     "pino": "^9.4.0",
     "dotenv": "^16.4.5"
