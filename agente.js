@@ -2,11 +2,18 @@
 // ║   AGENTE IA KAUÃ v3 — Inteligente, sem repetição           ║
 // ╚══════════════════════════════════════════════════════════════╝
 
+// ─── SAUDAÇÃO POR HORA ───────────────────────────────────────────────────────
+function getSaudacao(hora) {
+  if (hora >= 5 && hora < 12) return 'BOM DIA';
+  if (hora >= 12 && hora < 18) return 'BOA TARDE';
+  return 'BOA NOITE';
+}
+
 // ─── COPYS GERAIS (10 modelos) ───────────────────────────────────────────────
 const COPYS_GERAIS = [
-  `🌞 *BOM DIA! TEM OFERTA BOA HOJE!* 🌞\n🔥 *{NOME}* 🔥\n💰 De: ~~R$ {PRECO_ANTIGO}~~\n✅ Por apenas: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⏳ Aproveite enquanto a promoção estiver disponível.\n👉 Confira aqui:\n{LINK}`,
-  `🚨 *ACHADO DO DIA!* 🚨\n👀 Encontrei essa promoção e vim compartilhar!\n📦 *{NOME}*\n❌ De: ~~R$ {PRECO_ANTIGO}~~\n💥 Hoje por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 Veja antes que o preço mude:\n{LINK}`,
-  `☀️ *BOM DIA, PESSOAL!*\n🔥 Promoção disponível!\n📦 *{NOME}*\n💰 ~~R$ {PRECO_ANTIGO}~~\n✅ Agora por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Vale a pena conferir.\n👉 {LINK}`,
+  `🌞 *{SAUDACAO}! TEM OFERTA BOA HOJE!* 🌞\n🔥 *{NOME}* 🔥\n💰 De: ~~R$ {PRECO_ANTIGO}~~\n✅ Por apenas: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⏳ Aproveite enquanto a promoção estiver disponível.\n👉 Confira aqui:\n{LINK}`,
+  `🚨 *ACHADO DO DIA!* 🚨\n👀 Encontrei essa promoção e vim compartilhar!\n📦 *{NOME}*\n❌ De: ~~R$ {PRECO_ANTIGO}~~\n💥 Hoje por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 Veja antes que o estoque acabe!\n{LINK}`,
+  `☀️ *{SAUDACAO}, PESSOAL!*\n🔥 Promoção disponível!\n📦 *{NOME}*\n💰 ~~R$ {PRECO_ANTIGO}~~\n✅ Agora por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Vale a pena conferir.\n👉 {LINK}`,
   `🎁 *OFERTA ESPECIAL DO DIA* 🎁\n🔥 *{NOME}*\n💸 De: ~~R$ {PRECO_ANTIGO}~~\n💚 Por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👀 Aproveite enquanto durar.\n👉 {LINK}`,
   `🚀 *PROMOÇÃO LIBERADA!*\n📦 *{NOME}*\n💰 De ~~R$ {PRECO_ANTIGO}~~\n🔥 Por apenas *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⏳ O preço pode mudar a qualquer momento.\n👉 {LINK}`,
   `💥 *SUPER OFERTA!* 💥\n🛍️ *{NOME}*\n❌ ~~R$ {PRECO_ANTIGO}~~\n✅ *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👀 Dá uma olhada nessa promoção.\n👉 {LINK}`,
@@ -18,7 +25,7 @@ const COPYS_GERAIS = [
 
 // ─── COPYS MOTOBOY (6 modelos) ───────────────────────────────────────────────
 const COPYS_MOTOBOY = [
-  `🏍️ *ACHADO PARA MOTOCA!* 🏍️\n🔥 *{NOME}*\n💰 De: ~~R$ {PRECO_ANTIGO}~~\n✅ Por apenas: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Produto aprovado pelos irmãos do asfalto!\n👉 Confira aqui:\n{LINK}`,
+  `🏍️ *ACHADO PARA MOTOCA!* 🏍️\n🔥 *{NOME}*\n💰 De: ~~R$ {PRECO_ANTIGO}~~\n✅ Por apenas: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Produto aprovado pelos irmãos do asfalto!\n👉 Confira:\n{LINK}`,
   `🛵 *PROMOÇÃO PRA QUEM TÁ NA RODA!* 🛵\n📦 *{NOME}*\n❌ ~~R$ {PRECO_ANTIGO}~~\n💥 Agora por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🏍️ Essencial pra quem vive de moto!\n👉 {LINK}`,
   `🚨 *ATENÇÃO MOTOBOYS!* 🚨\n📢 Oferta imperdível chegou!\n🏍️ *{NOME}*\n💸 De: ~~R$ {PRECO_ANTIGO}~~\n💚 Por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⏳ Corre que é por tempo limitado!\n👉 {LINK}`,
   `⚡ *OFERTA RELÂMPAGO PARA MOTOCA!* ⚡\n🛵 *{NOME}*\n💰 De ~~R$ {PRECO_ANTIGO}~~\n🔥 Por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🏍️ Perfeito pra quem roda todo dia!\n👉 {LINK}`,
@@ -40,7 +47,7 @@ const DIAS_SEMANA = {
   6: ['moda','casa','tenis','decoracao','brinquedo','pet','roupa']                // Sábado
 };
 
-const SEMPRE_CONVERTE = ['air fryer','robo aspirador','smartwatch','fone bluetooth','carregador','power bank','tenis','perfume','bolsa','mochila','kit ferramentas','caixa de som','impressora','projetor','aspirador','escova secadora','skincare','panela','camera seguranca'];
+const SEMPRE_CONVERTE = ['air fryer','robo aspirador','smartwatch','fone bluetooth','carregador','power bank','tenis','perfume','bolsa','mochila','kit ferramentas','caixa de som','impressora','projetor'];
 
 // ─── HISTÓRICO POR GRUPO (evita repetição) ──────────────────────────────────
 const historicoPorGrupo = {}; // { grupoId: { produtos: [], copys: [] } }
@@ -58,7 +65,7 @@ function registrarUso(grupoId, produtoId, copyIdx) {
   if (h.copys.length > 10) h.copys = h.copys.slice(-10);
 }
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
+// ─── HELPERS ───────────────────────────────────────────────────────────────────
 function calcularDesconto(precoAntigo, precoAtual) {
   const a = parseFloat(String(precoAntigo).replace(',', '.'));
   const b = parseFloat(String(precoAtual).replace(',', '.'));
@@ -143,7 +150,7 @@ function escolherCopy(copys, grupoId) {
 }
 
 // ─── GERAR MENSAGEM ───────────────────────────────────────────────────────────
-function gerarMensagem(produto, tipo, grupoId) {
+function gerarMensagem(produto, tipo, grupoId, hora) {
   const desconto = calcularDesconto(produto.oldPrice, produto.price);
   const precoAtual = parseFloat(String(produto.price).replace(',', '.')).toFixed(2).replace('.', ',');
   const precoAntigo = parseFloat(String(produto.oldPrice).replace(',', '.')).toFixed(2).replace('.', ',');
@@ -155,6 +162,7 @@ function gerarMensagem(produto, tipo, grupoId) {
   registrarUso(grupoId, produto.id, idx);
 
   const mensagem = copys[idx]
+    .replace(/{SAUDACAO}/g, getSaudacao(hora))
     .replace(/{NOME}/g, produto.name)
     .replace(/{PRECO_ANTIGO}/g, precoAntigo)
     .replace(/{PRECO_ATUAL}/g, precoAtual)
@@ -164,7 +172,7 @@ function gerarMensagem(produto, tipo, grupoId) {
   return { mensagem, imageUrl: produto.imageUrl || null, produto: produto.name, desconto };
 }
 
-// ─── FUNÇÃO PRINCIPAL ─────────────────────────────────────────────────────────
+// ─── FUNÇÃO PRINCIPAL ───────────────────────────────────────────────────────
 function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada) {
   const agora = new Date();
   const diaSemana = agora.getDay();
@@ -175,7 +183,7 @@ function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada) {
     return null;
   }
 
-  const msg = gerarMensagem(resultado.produto, resultado.tipo, grupoId);
+  const msg = gerarMensagem(resultado.produto, resultado.tipo, grupoId, hora);
 
   const dias = ['Dom','Seg','Ter','Qua','Qui','Sex','Sab'];
   console.log(`🧠 Agente → Grupo: "${nomeGrupo}"`);
