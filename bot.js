@@ -209,16 +209,34 @@ async function agendarMensagensUsuario(userId) {
 }
 
 // ─── INICIAR CONEXÃO DE UM USUÁRIO ──────────────────────────────────────────
-async function iniciarConexaoUsuario(userId) {
+async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   if (sockets.has(userId)) return; // já conectado ou conectando
 
-  console.log(`\n🔌 [${userId}] Iniciando conexão...`);
+  console.log(`\n🔌 [${userId}] Iniciando conexão (método: ${metodo})...`);
   const { state, saveCreds } = await useSupabaseAuthState(userId);
   const sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: require('pino')({ level: 'silent' }) });
   sockets.set(userId, sock);
 
+  if (metodo === 'pairing' && telefone && !state.creds.registered) {
+    try {
+      const numeroLimpo = telefone.replace(/\D/g, '');
+      const code = await sock.requestPairingCode(numeroLimpo);
+      console.log(`🔑 [${userId}] Código de pareamento: ${code}`);
+      await supabase.from('bot_status').upsert({
+        user_id: userId, status: 'pairing', pairing_code: code, qr_code: null,
+        connection_method: 'pairing', updated_at: new Date().toISOString()
+      });
+    } catch (e) {
+      console.error(`❌ [${userId}] Erro ao gerar código de pareamento:`, e.message);
+      await supabase.from('bot_status').upsert({
+        user_id: userId, status: 'disconnected', pairing_code: null,
+        updated_at: new Date().toISOString()
+      });
+    }
+  }
+
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    if (qr) {
+    if (qr && metodo !== 'pairing') {
       console.log(`📱 [${userId}] QR Code gerado.`);
       qrcodeTerminal.generate(qr, { small: true });
       try {
