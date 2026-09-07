@@ -292,10 +292,23 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
 function monitorarSupabase() {
   supabase
     .channel('vendabot-bot-status')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_status' }, (payload) => {
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_status' }, async (payload) => {
       const row = payload.new;
-      if (row && row.status === 'requested' && !sockets.has(row.user_id)) {
-        iniciarConexaoUsuario(row.user_id);
+      if (!row) return;
+      if (row.status === 'requested' && !sockets.has(row.user_id)) {
+        iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+      }
+      if (row.status === 'disconnect_requested') {
+        const sock = sockets.get(row.user_id);
+        if (sock) {
+          try { await sock.logout(); } catch (e) { console.error(`❌ [${row.user_id}] Erro ao desconectar:`, e.message); }
+        } else {
+          await supabase.from('bot_status').upsert({
+            user_id: row.user_id, status: 'disconnected', qr_code: null, pairing_code: null,
+            updated_at: new Date().toISOString()
+          });
+          await supabase.from('bot_auth_state').delete().eq('user_id', row.user_id);
+        }
       }
     })
     .subscribe((status) => console.log(`📡 [bot_status] Realtime: ${status}`));
