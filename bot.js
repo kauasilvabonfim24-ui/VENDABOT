@@ -272,13 +272,15 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       cancelarJobsUsuario(userId);
       const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
       await supabase.from('bot_status').upsert({
-        user_id: userId, status: 'disconnected', qr_code: null, updated_at: new Date().toISOString()
+        user_id: userId, status: 'disconnected', qr_code: null, pairing_code: null,
+        updated_at: new Date().toISOString()
       });
       if (!deslogado) {
         console.log(`🔄 [${userId}] Reconectando em 5s...`);
         setTimeout(() => iniciarConexaoUsuario(userId), 5000);
       } else {
-        console.log(`❌ [${userId}] Sessão encerrada (logout). Precisa reconectar via painel.`);
+        console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
+        await supabase.from('bot_auth_state').delete().eq('user_id', userId);
       }
     }
   });
