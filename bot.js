@@ -4,7 +4,7 @@
 // npm install @whiskeysockets/baileys qrcode-terminal qrcode node-schedule pino @supabase/supabase-js dotenv
 
 require('dotenv').config();
-const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto, Browsers } = require('@whiskeysockets/baileys');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const schedule = require('node-schedule');
@@ -214,7 +214,12 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
 
   console.log(`\n🔌 [${userId}] Iniciando conexão (método: ${metodo})...`);
   const { state, saveCreds } = await useSupabaseAuthState(userId);
-  const sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: require('pino')({ level: 'silent' }) });
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    logger: require('pino')({ level: 'silent' }),
+    browser: Browsers.macOS('Chrome')
+  });
   sockets.set(userId, sock);
 
   if (metodo === 'pairing' && telefone && !state.creds.registered) {
