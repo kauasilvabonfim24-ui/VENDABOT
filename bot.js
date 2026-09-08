@@ -223,53 +223,34 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   });
   sockets.set(userId, sock);
 
-  // Só pede um código de pareamento novo se ainda não tiver um pendente para esse usuário.
-  // O Baileys fecha a conexão sozinho (restartRequired) logo depois de gerar o código —
-  // isso é esperado e NÃO deve gerar outro código, senão o código exibido na tela vira
-  // obsoleto antes do usuário conseguir digitar (era a causa do "Não foi possível conectar").
-  if (metodo === 'pairing' && telefone && !state.creds.registered && !pairingPendente.has(userId)) {
-    try {
-      const numeroLimpo = telefone.replace(/\D/g, '');
-      // O socket acabou de ser criado — às vezes o WebSocket com o WhatsApp ainda não
-      // terminou de abrir nesse exato instante, e pedir o código nesse momento cai em
-      // "Connection Closed" por pura corrida de tempo. Tenta algumas vezes com um
-      // intervalo curto antes de desistir de verdade.
-      let code;
-      let ultimoErro;
-      for (let tentativa = 1; tentativa <= 3; tentativa++) {
-        try {
-          code = await sock.requestPairingCode(numeroLimpo);
-          break;
-        } catch (e) {
-          ultimoErro = e;
-          if (tentativa < 3) await new Promise(r => setTimeout(r, 1500));
-        }
-      }
-      if (!code) throw ultimoErro;
-      pairingPendente.add(userId);
-      console.log(`🔑 [${userId}] Código de pareamento: ${code}`);
-      await supabase.from('bot_status').upsert({
-        user_id: userId, status: 'pairing', pairing_code: code, qr_code: null,
-        connection_method: 'pairing', updated_at: new Date().toISOString()
-      });
-      // Importante: NÃO colocamos um timer local pra "expirar" essa trava sozinha.
-      // Só um novo pedido explícito do usuário (clique em "Gerar novo código", que já
-      // limpa isso lá embaixo em monitorarSupabase) deve liberar gerar um código novo.
-      // Um timer automático aqui fazia o bot pedir código novo sozinho em qualquer
-      // reconexão de fundo, trocando o código sem o usuário saber — era a causa do
-      // "código expira rápido demais".
-    } catch (e) {
-      console.error(`❌ [${userId}] Erro ao gerar código de pareamento:`, e.message);
-      pairingPendente.delete(userId);
-      await supabase.from('bot_status').upsert({
-        user_id: userId, status: 'disconnected', pairing_code: null,
-        updated_at: new Date().toISOString()
-      });
-    }
-  }
-
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    if (qr && metodo !== 'pairing') {
+    // O evento 'qr' é o sinal de que a conexão terminou o handshake inicial e está
+    // pronta pra autenticação — tanto pro fluxo de QR quanto pro de pairing. Pedir o
+    // código de pareamento ANTES desse sinal (logo após criar o socket) é o que causava
+    // "código gerado mas rejeitado/não conecta quando digitado": o pedido saía cedo
+    // demais, antes do WhatsApp confirmar que a sessão estava pronta pra receber ele.
+    if (qr && metodo === 'pairing' && telefone && !state.creds.registered && !pairingPendente.has(userId)) {
+      try {
+        const numeroLimpo = telefone.replace(/\D/g, '');
+        const code = await sock.requestPairingCode(numeroLimpo);
+        pairingPendente.add(userId);
+        console.log(`🔑 [${userId}] Código de pareamento: ${code}`);
+        await supabase.from('bot_status').upsert({
+          user_id: userId, status: 'pairing', pairing_code: code, qr_code: null,
+          connection_method: 'pairing', updated_at: new Date().toISOString()
+        });
+        // Importante: NÃO colocamos um timer local pra "expirar" essa trava sozinha.
+        // Só um novo pedido explícito do usuário (clique em "Gerar novo código", que já
+        // limpa isso lá embaixo em monitorarSupabase) deve liberar gerar um código novo.
+      } catch (e) {
+        console.error(`❌ [${userId}] Erro ao gerar código de pareamento:`, e.message);
+        pairingPendente.delete(userId);
+        await supabase.from('bot_status').upsert({
+          user_id: userId, status: 'disconnected', pairing_code: null,
+          updated_at: new Date().toISOString()
+        });
+      }
+    } else if (qr && metodo !== 'pairing') {
       console.log(`📱 [${userId}] QR Code gerado.`);
       qrcodeTerminal.generate(qr, { small: true });
       try {
