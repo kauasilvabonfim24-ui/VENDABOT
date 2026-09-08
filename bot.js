@@ -282,7 +282,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       });
       if (!deslogado) {
         console.log(`🔄 [${userId}] Reconectando em 5s...`);
-        setTimeout(() => iniciarConexaoUsuario(userId), 5000);
+        setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
       } else {
         console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
         await supabase.from('bot_auth_state').delete().eq('user_id', userId);
