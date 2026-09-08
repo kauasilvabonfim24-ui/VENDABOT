@@ -300,7 +300,12 @@ function monitorarSupabase() {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_status' }, async (payload) => {
       const row = payload.new;
       if (!row) return;
-      if (row.status === 'requested' && !sockets.has(row.user_id)) {
+      if (row.status === 'requested') {
+        const socketPreso = sockets.get(row.user_id);
+        if (socketPreso) {
+          try { socketPreso.end(new Error('Nova tentativa de conexão solicitada')); } catch (e) {}
+          sockets.delete(row.user_id);
+        }
         iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
       }
       if (row.status === 'disconnect_requested') {
