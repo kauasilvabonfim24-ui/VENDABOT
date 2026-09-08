@@ -338,13 +338,13 @@ function monitorarSupabase() {
 async function reconectarUsuariosExistentes() {
   const { data, error } = await supabase
     .from('bot_status')
-    .select('user_id')
-    .in('status', ['connected', 'qr', 'requested']);
+    .select('user_id, connection_method, phone_number')
+    .in('status', ['connected', 'qr', 'requested', 'pairing']);
 
   if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
 
   for (const row of data || []) {
-    await iniciarConexaoUsuario(row.user_id);
+    await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
   }
   console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
 }
