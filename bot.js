@@ -298,8 +298,20 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
         });
       }
       if (!deslogado) {
-        console.log(`🔄 [${userId}] Reconectando em 5s...`);
-        setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
+        if (aguardandoDigitacao) {
+          // NÃO reconecta agora: reconectar aqui abriria um socket novo e invalidaria
+          // o código de pareamento que está na tela do usuário antes que ele consiga
+          // digitar. Só tenta de novo depois que a janela do código expirar (120s em
+          // pairingPendente); se o usuário digitar o código a tempo, o WhatsApp conecta
+          // por essa mesma sessão e esse timeout nem chega a rodar (sockets.has já será true).
+          console.log(`⏳ [${userId}] Código de pareamento pendente — aguardando digitação, sem reconectar agora.`);
+          setTimeout(() => {
+            if (!sockets.has(userId)) iniciarConexaoUsuario(userId, metodo, telefone);
+          }, 125000);
+        } else {
+          console.log(`🔄 [${userId}] Reconectando em 5s...`);
+          setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
+        }
       } else {
         console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
         pairingPendente.delete(userId);
