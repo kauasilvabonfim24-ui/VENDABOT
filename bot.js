@@ -230,16 +230,34 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   if (metodo === 'pairing' && telefone && !state.creds.registered && !pairingPendente.has(userId)) {
     try {
       const numeroLimpo = telefone.replace(/\D/g, '');
-      const code = await sock.requestPairingCode(numeroLimpo);
+      // O socket acabou de ser criado — às vezes o WebSocket com o WhatsApp ainda não
+      // terminou de abrir nesse exato instante, e pedir o código nesse momento cai em
+      // "Connection Closed" por pura corrida de tempo. Tenta algumas vezes com um
+      // intervalo curto antes de desistir de verdade.
+      let code;
+      let ultimoErro;
+      for (let tentativa = 1; tentativa <= 3; tentativa++) {
+        try {
+          code = await sock.requestPairingCode(numeroLimpo);
+          break;
+        } catch (e) {
+          ultimoErro = e;
+          if (tentativa < 3) await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+      if (!code) throw ultimoErro;
       pairingPendente.add(userId);
       console.log(`🔑 [${userId}] Código de pareamento: ${code}`);
       await supabase.from('bot_status').upsert({
         user_id: userId, status: 'pairing', pairing_code: code, qr_code: null,
         connection_method: 'pairing', updated_at: new Date().toISOString()
       });
-      // O código do WhatsApp expira sozinho depois de ~2min. Se ninguém digitar a tempo,
-      // libera a flag pra próxima tentativa poder gerar um código novo de verdade.
-      setTimeout(() => pairingPendente.delete(userId), 120000);
+      // Importante: NÃO colocamos um timer local pra "expirar" essa trava sozinha.
+      // Só um novo pedido explícito do usuário (clique em "Gerar novo código", que já
+      // limpa isso lá embaixo em monitorarSupabase) deve liberar gerar um código novo.
+      // Um timer automático aqui fazia o bot pedir código novo sozinho em qualquer
+      // reconexão de fundo, trocando o código sem o usuário saber — era a causa do
+      // "código expira rápido demais".
     } catch (e) {
       console.error(`❌ [${userId}] Erro ao gerar código de pareamento:`, e.message);
       pairingPendente.delete(userId);
@@ -298,20 +316,8 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
         });
       }
       if (!deslogado) {
-        if (aguardandoDigitacao) {
-          // NÃO reconecta agora: reconectar aqui abriria um socket novo e invalidaria
-          // o código de pareamento que está na tela do usuário antes que ele consiga
-          // digitar. Só tenta de novo depois que a janela do código expirar (120s em
-          // pairingPendente); se o usuário digitar o código a tempo, o WhatsApp conecta
-          // por essa mesma sessão e esse timeout nem chega a rodar (sockets.has já será true).
-          console.log(`⏳ [${userId}] Código de pareamento pendente — aguardando digitação, sem reconectar agora.`);
-          setTimeout(() => {
-            if (!sockets.has(userId)) iniciarConexaoUsuario(userId, metodo, telefone);
-          }, 125000);
-        } else {
-          console.log(`🔄 [${userId}] Reconectando em 5s...`);
-          setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
-        }
+        console.log(`🔄 [${userId}] Reconectando em 5s...`);
+        setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
       } else {
         console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
         pairingPendente.delete(userId);
