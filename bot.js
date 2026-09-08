@@ -20,6 +20,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 // ─── ESTADO EM MEMÓRIA (por processo) ────────────────────────────────────────
 const sockets = new Map();       // user_id -> socket Baileys ativo
 const jobsPorUsuario = new Map(); // user_id -> array de jobs agendados
+const pairingPendente = new Set(); // user_id -> já pediu código de pareamento nessa rodada, aguardando o usuário digitar
 
 // ─── SERVIDOR HTTP MÍNIMO (satisfaz o Health Check do Render) ───────────────
 const http = require('http');
@@ -222,17 +223,26 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   });
   sockets.set(userId, sock);
 
-  if (metodo === 'pairing' && telefone && !state.creds.registered) {
+  // Só pede um código de pareamento novo se ainda não tiver um pendente para esse usuário.
+  // O Baileys fecha a conexão sozinho (restartRequired) logo depois de gerar o código —
+  // isso é esperado e NÃO deve gerar outro código, senão o código exibido na tela vira
+  // obsoleto antes do usuário conseguir digitar (era a causa do "Não foi possível conectar").
+  if (metodo === 'pairing' && telefone && !state.creds.registered && !pairingPendente.has(userId)) {
     try {
       const numeroLimpo = telefone.replace(/\D/g, '');
       const code = await sock.requestPairingCode(numeroLimpo);
+      pairingPendente.add(userId);
       console.log(`🔑 [${userId}] Código de pareamento: ${code}`);
       await supabase.from('bot_status').upsert({
         user_id: userId, status: 'pairing', pairing_code: code, qr_code: null,
         connection_method: 'pairing', updated_at: new Date().toISOString()
       });
+      // O código do WhatsApp expira sozinho depois de ~2min. Se ninguém digitar a tempo,
+      // libera a flag pra próxima tentativa poder gerar um código novo de verdade.
+      setTimeout(() => pairingPendente.delete(userId), 120000);
     } catch (e) {
       console.error(`❌ [${userId}] Erro ao gerar código de pareamento:`, e.message);
+      pairingPendente.delete(userId);
       await supabase.from('bot_status').upsert({
         user_id: userId, status: 'disconnected', pairing_code: null,
         updated_at: new Date().toISOString()
@@ -255,6 +265,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     }
 
     if (connection === 'open') {
+      pairingPendente.delete(userId);
       console.log(`✅ [${userId}] CONECTADO!`);
       await supabase.from('bot_status').upsert({
         user_id: userId, status: 'connected', qr_code: null, updated_at: new Date().toISOString()
@@ -276,15 +287,22 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       sockets.delete(userId);
       cancelarJobsUsuario(userId);
       const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
-      await supabase.from('bot_status').upsert({
-        user_id: userId, status: 'disconnected', qr_code: null, pairing_code: null,
-        updated_at: new Date().toISOString()
-      });
+      // Se ainda estamos dentro da janela de um pairing code pendente, essa é a
+      // desconexão esperada logo após gerar o código (restartRequired) — não apaga
+      // o código que está na tela do usuário, senão o app mostra "desconectado" à toa.
+      const aguardandoDigitacao = metodo === 'pairing' && pairingPendente.has(userId) && !deslogado;
+      if (!aguardandoDigitacao) {
+        await supabase.from('bot_status').upsert({
+          user_id: userId, status: 'disconnected', qr_code: null, pairing_code: null,
+          updated_at: new Date().toISOString()
+        });
+      }
       if (!deslogado) {
         console.log(`🔄 [${userId}] Reconectando em 5s...`);
         setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
       } else {
         console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
+        pairingPendente.delete(userId);
         await supabase.from('bot_auth_state').delete().eq('user_id', userId);
       }
     }
@@ -306,6 +324,7 @@ function monitorarSupabase() {
           try { socketPreso.end(new Error('Nova tentativa de conexão solicitada')); } catch (e) {}
           sockets.delete(row.user_id);
         }
+        pairingPendente.delete(row.user_id); // pedido explícito de nova tentativa: libera gerar código novo
         iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
       }
       if (row.status === 'disconnect_requested') {
@@ -314,6 +333,7 @@ function monitorarSupabase() {
           try { await sock.logout(); } catch (e) { console.error(`❌ [${row.user_id}] Erro ao desconectar:`, e.message); }
           sockets.delete(row.user_id);
         }
+        pairingPendente.delete(row.user_id);
         await supabase.from('bot_status').upsert({
           user_id: row.user_id, status: 'disconnected', qr_code: null, pairing_code: null,
           updated_at: new Date().toISOString()
