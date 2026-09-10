@@ -24,6 +24,32 @@ const pairingPendente = new Set(); // user_id -> já pediu código de pareamento
 
 const reconectandoAposQueda = new Set(); // user_id -> caiu e está no meio da reconexão automática (pra notificar só quando voltar)
 
+// ─── VERSÃO DO PROTOCOLO WHATSAPP (cacheada) ────────────────────────────────
+// fetchLatestBaileysVersion() faz uma chamada de rede. Buscar isso do zero em
+// TODA tentativa de conexão atrasa o momento em que o QR/código de pareamento
+// aparece pro usuário — crítico no fluxo de pairing, onde o código do WhatsApp
+// expira rápido (~60s). Por isso cacheamos em memória e só renovamos de tempos
+// em tempos, em vez de bater na rede toda vez.
+let waVersionCache = null;
+let waVersionCacheEm = 0;
+const WA_VERSION_CACHE_MS = 6 * 60 * 60 * 1000; // 6 horas
+
+async function obterVersaoWhatsApp(userId) {
+  const agora = Date.now();
+  if (waVersionCache && (agora - waVersionCacheEm) < WA_VERSION_CACHE_MS) {
+    return waVersionCache;
+  }
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    waVersionCache = version;
+    waVersionCacheEm = agora;
+    console.log(`🔄 [${userId}] Versão do protocolo WhatsApp atualizada: ${version.join('.')}`);
+  } catch (e) {
+    console.error(`⚠️ [${userId}] Não foi possível buscar a versão mais recente, usando cache/padrão do pacote:`, e.message);
+  }
+  return waVersionCache;
+}
+
 // ─── NOTIFICAÇÃO PUSH (OneSignal via Edge Function send-push) ──────────────
 // Não quebra o bot se faltar a env var ou se a chamada falhar — só loga o erro.
 async function notificarReconexao(userId) {
@@ -243,18 +269,9 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   console.log(`\n🔌 [${userId}] Iniciando conexão (método: ${metodo})...`);
   const { state, saveCreds } = await useSupabaseAuthState(userId);
 
-  // Sempre negocia a versão mais recente do protocolo do WhatsApp nesta conexão,
-  // em vez de depender só da versão hardcoded dentro do pacote instalado. Isso é
-  // o que mantém o bot "sempre atualizado" mesmo que passe muito tempo sem
-  // reconectar (ex: sessão estável no método por número de telefone).
-  let waVersion;
-  try {
-    const { version } = await fetchLatestBaileysVersion();
-    waVersion = version;
-    console.log(`🔄 [${userId}] Versão do protocolo WhatsApp: ${version.join('.')}`);
-  } catch (e) {
-    console.error(`⚠️ [${userId}] Não foi possível buscar a versão mais recente, usando a padrão do pacote:`, e.message);
-  }
+  // Versão do protocolo do WhatsApp, cacheada (ver obterVersaoWhatsApp acima) —
+  // evita atrasar o QR/código de pareamento com uma busca de rede toda vez.
+  const waVersion = await obterVersaoWhatsApp(userId);
 
   const sock = makeWASocket({
     auth: state,
