@@ -21,8 +21,13 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const sockets = new Map();       // user_id -> socket Baileys ativo
 const jobsPorUsuario = new Map(); // user_id -> array de jobs agendados
 const pairingPendente = new Set(); // user_id -> já pediu código de pareamento nessa rodada, aguardando o usuário digitar
-
 const reconectandoAposQueda = new Set(); // user_id -> caiu e está no meio da reconexão automática (pra notificar só quando voltar)
+const socketGeracao = new Map(); // user_id -> número da tentativa de conexão atual. Todo socket novo incrementa esse
+// número; os handlers de eventos do socket ANTERIOR (que pode levar alguns segundos pra
+// terminar de se desligar de verdade) checam esse número e viram no-op se já foram
+// superados. Sem isso, um socket velho ainda "morrendo" pode sobrescrever o status/estado
+// do socket novo no meio de uma reconexão rápida (ex: usuário clicando "gerar novo código"
+// mais de uma vez), causando logout/timeout fantasma no socket novo.
 
 // ─── VERSÃO DO PROTOCOLO WHATSAPP (cacheada) ────────────────────────────────
 // fetchLatestBaileysVersion() faz uma chamada de rede. Buscar isso do zero em
@@ -46,8 +51,9 @@ async function obterVersaoWhatsApp(userId) {
     console.log(`🔄 [${userId}] Versão do protocolo WhatsApp atualizada: ${version.join('.')}`);
   } catch (e) {
     console.error(`⚠️ [${userId}] Não foi possível buscar a versão mais recente, usando cache/padrão do pacote:`, e.message);
+    // Mantém o cache antigo (se houver) em vez de derrubar a conexão por causa disso.
   }
-  return waVersionCache;
+  return waVersionCache; // pode ser null na primeiríssima vez que a busca falhar — Baileys cai pro padrão do pacote
 }
 
 // ─── NOTIFICAÇÃO PUSH (OneSignal via Edge Function send-push) ──────────────
@@ -273,6 +279,9 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   // evita atrasar o QR/código de pareamento com uma busca de rede toda vez.
   const waVersion = await obterVersaoWhatsApp(userId);
 
+  const minhaGeracao = (socketGeracao.get(userId) || 0) + 1;
+  socketGeracao.set(userId, minhaGeracao);
+
   const sock = makeWASocket({
     auth: state,
     version: waVersion, // undefined aqui faz o Baileys cair de volta na versão padrão do pacote
@@ -283,6 +292,10 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   sockets.set(userId, sock);
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+    // Socket superado por uma nova tentativa de conexão (ex: usuário pediu novo código
+    // de pareamento enquanto este ainda estava terminando de se desligar) — ignora.
+    if (socketGeracao.get(userId) !== minhaGeracao) return;
+
     // O evento 'qr' é o sinal de que a conexão terminou o handshake inicial e está
     // pronta pra autenticação — tanto pro fluxo de QR quanto pro de pairing. Pedir o
     // código de pareamento ANTES desse sinal (logo após criar o socket) é o que causava
@@ -371,7 +384,10 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', async (...args) => {
+    if (socketGeracao.get(userId) !== minhaGeracao) return; // socket superado, ignora
+    await saveCreds(...args);
+  });
 }
 
 // ─── ESCUTAR PEDIDOS DE CONEXÃO E MUDANÇAS DE CONFIG ────────────────────────
@@ -384,6 +400,9 @@ function monitorarSupabase() {
       if (row.status === 'requested') {
         const socketPreso = sockets.get(row.user_id);
         if (socketPreso) {
+          // Invalida os handlers do socket antigo JÁ, antes mesmo dele terminar de se
+          // desligar de verdade — é isso que impede ele de sobrescrever o status do novo.
+          socketGeracao.set(row.user_id, (socketGeracao.get(row.user_id) || 0) + 1);
           try { socketPreso.end(new Error('Nova tentativa de conexão solicitada')); } catch (e) {}
           sockets.delete(row.user_id);
         }
@@ -393,6 +412,7 @@ function monitorarSupabase() {
       if (row.status === 'disconnect_requested') {
         const sock = sockets.get(row.user_id);
         if (sock) {
+          socketGeracao.set(row.user_id, (socketGeracao.get(row.user_id) || 0) + 1);
           try { await sock.logout(); } catch (e) { console.error(`❌ [${row.user_id}] Erro ao desconectar:`, e.message); }
           sockets.delete(row.user_id);
         }
