@@ -22,6 +22,33 @@ const sockets = new Map();       // user_id -> socket Baileys ativo
 const jobsPorUsuario = new Map(); // user_id -> array de jobs agendados
 const pairingPendente = new Set(); // user_id -> já pediu código de pareamento nessa rodada, aguardando o usuário digitar
 
+const reconectandoAposQueda = new Set(); // user_id -> caiu e está no meio da reconexão automática (pra notificar só quando voltar)
+
+// ─── NOTIFICAÇÃO PUSH (OneSignal via Edge Function send-push) ──────────────
+// Não quebra o bot se faltar a env var ou se a chamada falhar — só loga o erro.
+async function notificarReconexao(userId) {
+  if (!process.env.INTERNAL_TRIGGER_SECRET) {
+    console.warn(`⚠️ [${userId}] INTERNAL_TRIGGER_SECRET não configurado no Render — pulando notificação de reconexão.`);
+    return;
+  }
+  try {
+    const resp = await fetch(`${process.env.SUPABASE_URL}/functions/v1/send-push`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret: process.env.INTERNAL_TRIGGER_SECRET,
+        user_id: userId,
+        title: 'Bot reconectado ✅',
+        message: 'Seu WhatsApp voltou a ficar conectado e já está enviando mensagens normalmente.'
+      })
+    });
+    const result = await resp.json().catch(() => null);
+    console.log(`🔔 [${userId}] Notificação de reconexão: ${resp.ok ? 'enviada' : 'falhou'}`, result || '');
+  } catch (e) {
+    console.error(`❌ [${userId}] Erro ao notificar reconexão:`, e.message);
+  }
+}
+
 // ─── SERVIDOR HTTP MÍNIMO (satisfaz o Health Check do Render) ───────────────
 const http = require('http');
 const PORT = process.env.PORT || 3000;
@@ -284,6 +311,10 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       await supabase.from('bot_status').upsert({
         user_id: userId, status: 'connected', qr_code: null, updated_at: new Date().toISOString()
       });
+      if (reconectandoAposQueda.has(userId)) {
+        reconectandoAposQueda.delete(userId);
+        notificarReconexao(userId); // dispara em segundo plano, não trava o fluxo de conexão
+      }
       setTimeout(async () => {
         try {
           const grupos = await sock.groupFetchAllParticipating();
@@ -313,6 +344,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       }
       if (!deslogado) {
         console.log(`🔄 [${userId}] Reconectando em 5s...`);
+        reconectandoAposQueda.add(userId);
         setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
       } else {
         console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
