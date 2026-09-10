@@ -4,7 +4,7 @@
 // npm install @whiskeysockets/baileys qrcode-terminal qrcode node-schedule pino @supabase/supabase-js dotenv
 
 require('dotenv').config();
-const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const schedule = require('node-schedule');
@@ -215,8 +215,23 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
 
   console.log(`\n🔌 [${userId}] Iniciando conexão (método: ${metodo})...`);
   const { state, saveCreds } = await useSupabaseAuthState(userId);
+
+  // Sempre negocia a versão mais recente do protocolo do WhatsApp nesta conexão,
+  // em vez de depender só da versão hardcoded dentro do pacote instalado. Isso é
+  // o que mantém o bot "sempre atualizado" mesmo que passe muito tempo sem
+  // reconectar (ex: sessão estável no método por número de telefone).
+  let waVersion;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    waVersion = version;
+    console.log(`🔄 [${userId}] Versão do protocolo WhatsApp: ${version.join('.')}`);
+  } catch (e) {
+    console.error(`⚠️ [${userId}] Não foi possível buscar a versão mais recente, usando a padrão do pacote:`, e.message);
+  }
+
   const sock = makeWASocket({
     auth: state,
+    version: waVersion, // undefined aqui faz o Baileys cair de volta na versão padrão do pacote
     printQRInTerminal: false,
     logger: require('pino')({ level: 'silent' }),
     browser: Browsers.macOS('Chrome')
