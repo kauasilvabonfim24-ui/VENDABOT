@@ -29,6 +29,19 @@ const socketGeracao = new Map(); // user_id -> número da tentativa de conexão 
 // do socket novo no meio de uma reconexão rápida (ex: usuário clicando "gerar novo código"
 // mais de uma vez), causando logout/timeout fantasma no socket novo.
 
+// ─── AQUECIMENTO DO SERVIDOR ─────────────────────────────────────────────────
+// Logo após o processo subir (ex: acabou de acordar de hibernação/redeploy no
+// plano free do Render), a instância fica instável por alguns segundos — rede
+// lenta, CPU compartilhada em throttling. Tentar QR/pareamento nesse momento
+// falha ou expira o código à toa. Por isso adiamos qualquer tentativa de conexão
+// nova até esse período passar, e devolvemos um status "iniciando" pro painel
+// enquanto isso, em vez de deixar o cliente tomar um erro seco do WhatsApp.
+const SERVER_START = Date.now();
+const AQUECIMENTO_MS = 20000; // 20s
+function aindaAquecendo() {
+  return Date.now() - SERVER_START < AQUECIMENTO_MS;
+}
+
 // ─── VERSÃO DO PROTOCOLO WHATSAPP (cacheada) ────────────────────────────────
 // fetchLatestBaileysVersion() faz uma chamada de rede. Buscar isso do zero em
 // TODA tentativa de conexão atrasa o momento em que o QR/código de pareamento
@@ -407,7 +420,19 @@ function monitorarSupabase() {
           sockets.delete(row.user_id);
         }
         pairingPendente.delete(row.user_id); // pedido explícito de nova tentativa: libera gerar código novo
-        iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+        if (aindaAquecendo()) {
+          const faltam = AQUECIMENTO_MS - (Date.now() - SERVER_START);
+          console.log(`🔥 [${row.user_id}] Servidor ainda aquecendo, adiando conexão em ${Math.ceil(faltam / 1000)}s...`);
+          await supabase.from('bot_status').upsert({
+            user_id: row.user_id, status: 'iniciando', qr_code: null, pairing_code: null,
+            updated_at: new Date().toISOString()
+          });
+          setTimeout(() => {
+            iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+          }, faltam + 500);
+        } else {
+          iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+        }
       }
       if (row.status === 'disconnect_requested') {
         const sock = sockets.get(row.user_id);
@@ -462,4 +487,7 @@ process.on('unhandledRejection', e => console.error('🔴 ERRO PROMISE:', e.mess
 
 console.log('🤖 VendaBot multi-tenant iniciando...\n');
 monitorarSupabase();
-reconectarUsuariosExistentes();
+setTimeout(() => {
+  console.log('🔥 Aquecimento concluído, reconectando usuários existentes...');
+  reconectarUsuariosExistentes();
+}, AQUECIMENTO_MS);
