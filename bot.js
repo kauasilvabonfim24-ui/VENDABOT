@@ -374,7 +374,10 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     if (connection === 'close') {
       sockets.delete(userId);
       cancelarJobsUsuario(userId);
-      const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
+      const codigoMotivo = lastDisconnect?.error?.output?.statusCode;
+      const mensagemMotivo = lastDisconnect?.error?.message;
+      console.log(`🔎 [${userId}] Motivo da desconexão — código: ${codigoMotivo} | mensagem: ${mensagemMotivo}`);
+      const deslogado = codigoMotivo === DisconnectReason.loggedOut;
       // Se ainda estamos dentro da janela de um pairing code pendente, essa é a
       // desconexão esperada logo após gerar o código (restartRequired) — não apaga
       // o código que está na tela do usuário, senão o app mostra "desconectado" à toa.
