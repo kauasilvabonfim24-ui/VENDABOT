@@ -301,28 +301,21 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     version: waVersion, // undefined aqui faz o Baileys cair de volta na versão padrão do pacote
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: Browsers.macOS('Chrome'),
-    // Opções recomendadas pra estabilidade em multi-tenant/cloud, específicas do fluxo
-    // de código de pareamento (evitam "Connection Closed"/timeout artificial durante
-    // o handshake e reduzem tráfego desnecessário que atrapalha o pareamento):
-    defaultQueryTimeoutMs: undefined,
-    keepAliveIntervalMs: 30_000,
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    qrTimeout: undefined
+    browser: Browsers.macOS('Chrome')
   });
   sockets.set(userId, sock);
 
-  // CORREÇÃO: o código de pareamento é pedido IMEDIATAMENTE após criar o socket —
-  // é o padrão oficial do Baileys (sock.requestPairingCode logo após makeWASocket,
-  // sem esperar nenhum evento). A versão anterior esperava o evento 'qr' dentro do
-  // connection.update antes de pedir o código; isso cria uma corrida: o handshake do
-  // fluxo de pareamento por número não se comporta igual ao do QR, e esperar o 'qr'
-  // atrasava o pedido pro momento errado, deixando a sessão gerada instável (conecta
-  // e cai poucos segundos depois). O requestPairingCode já lida internamente com a
-  // espera do handshake — não precisa (e não deve) esperar o 'qr' primeiro.
-  if (metodo === 'pairing' && telefone && !state.creds.registered && !pairingPendente.has(userId)) {
-    (async () => {
+  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+    // Socket superado por uma nova tentativa de conexão (ex: usuário pediu novo código
+    // de pareamento enquanto este ainda estava terminando de se desligar) — ignora.
+    if (socketGeracao.get(userId) !== minhaGeracao) return;
+
+    // O evento 'qr' é o sinal de que a conexão terminou o handshake inicial e está
+    // pronta pra autenticação — tanto pro fluxo de QR quanto pro de pairing. Pedir o
+    // código de pareamento ANTES desse sinal (logo após criar o socket) é o que causava
+    // "código gerado mas rejeitado/não conecta quando digitado": o pedido saía cedo
+    // demais, antes do WhatsApp confirmar que a sessão estava pronta pra receber ele.
+    if (qr && metodo === 'pairing' && telefone && !state.creds.registered && !pairingPendente.has(userId)) {
       try {
         const numeroLimpo = telefone.replace(/\D/g, '');
         const code = await sock.requestPairingCode(numeroLimpo);
@@ -338,21 +331,12 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       } catch (e) {
         console.error(`❌ [${userId}] Erro ao gerar código de pareamento:`, e.message);
         pairingPendente.delete(userId);
-        sockets.delete(userId);
         await supabase.from('bot_status').upsert({
           user_id: userId, status: 'disconnected', pairing_code: null,
           updated_at: new Date().toISOString()
         });
       }
-    })();
-  }
-
-  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    // Socket superado por uma nova tentativa de conexão (ex: usuário pediu novo código
-    // de pareamento enquanto este ainda estava terminando de se desligar) — ignora.
-    if (socketGeracao.get(userId) !== minhaGeracao) return;
-
-    if (qr && metodo !== 'pairing') {
+    } else if (qr && metodo !== 'pairing') {
       console.log(`📱 [${userId}] QR Code gerado.`);
       qrcodeTerminal.generate(qr, { small: true });
       try {
@@ -391,13 +375,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     if (connection === 'close') {
       sockets.delete(userId);
       cancelarJobsUsuario(userId);
-
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      // CORREÇÃO: antes não logávamos isso em lugar nenhum — por isso os logs do
-      // Render não mostravam NENHUMA pista do motivo real da queda. Agora sempre loga.
-      console.log(`⚠️ [${userId}] Conexão fechada. statusCode=${statusCode ?? 'desconhecido'} motivo="${lastDisconnect?.error?.message || '—'}"`);
-
-      const deslogado = statusCode === DisconnectReason.loggedOut;
+      const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
       // Se ainda estamos dentro da janela de um pairing code pendente, essa é a
       // desconexão esperada logo após gerar o código (restartRequired) — não apaga
       // o código que está na tela do usuário, senão o app mostra "desconectado" à toa.
@@ -409,15 +387,9 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
         });
       }
       if (!deslogado) {
-        // CORREÇÃO: restartRequired (515) é o comportamento NORMAL logo depois de um
-        // pareamento (QR ou número) bem-sucedido — o WhatsApp pede reconexão imediata,
-        // sem espera. A versão anterior esperava 5s pra TODA desconexão sem distinção;
-        // isso atrasava esse reconnect esperado bem na hora em que a sessão do
-        // pareamento por número ainda está instável/terminando de se firmar.
-        const delayMs = statusCode === DisconnectReason.restartRequired ? 0 : 5000;
-        console.log(`🔄 [${userId}] Reconectando em ${delayMs / 1000}s...`);
+        console.log(`🔄 [${userId}] Reconectando em 5s...`);
         reconectandoAposQueda.add(userId);
-        setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), delayMs);
+        setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
       } else {
         console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
         pairingPendente.delete(userId);
