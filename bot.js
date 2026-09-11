@@ -206,6 +206,15 @@ function resolverGrupos(ag, config) {
 }
 
 async function enviarMensagem(sock, jid, texto, imageUrl, tentativas = 3) {
+  // Força o Baileys a atualizar a lista de participantes deste grupo antes de mandar.
+  // Em grupos recém-criados/recém-entrados, a sessão de criptografia com os
+  // participantes pode não ter sido construída ainda, causando erro "No sessions"
+  // na primeira tentativa de envio. Essa chamada (leitura, não modifica nada)
+  // "acorda" essa construção de sessão antes do sendMessage de verdade.
+  if (jid.endsWith('@g.us')) {
+    try { await sock.groupMetadata(jid); } catch (e) { /* não bloqueia o envio por causa disso */ }
+  }
+
   for (let i = 1; i <= tentativas; i++) {
     try {
       if (imageUrl && imageUrl.startsWith('http')) {
