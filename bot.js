@@ -3,13 +3,15 @@
 // ╚══════════════════════════════════════════════════════╝
 // npm install @whiskeysockets/baileys qrcode-terminal qrcode node-schedule pino @supabase/supabase-js dotenv
 
-require('dotenv').config();
-const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
-const qrcodeTerminal = require('qrcode-terminal');
-const QRCode = require('qrcode');
-const schedule = require('node-schedule');
-const { createClient } = require('@supabase/supabase-js');
-const agente = require('./agente');
+import 'dotenv/config';
+import makeWASocket, { DisconnectReason, initAuthCreds, BufferJSON, proto, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import qrcodeTerminal from 'qrcode-terminal';
+import QRCode from 'qrcode';
+import schedule from 'node-schedule';
+import { createClient } from '@supabase/supabase-js';
+import pino from 'pino';
+import http from 'http';
+import * as agente from './agente.js';
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
   console.error('❌ Faltando SUPABASE_URL ou SUPABASE_SERVICE_KEY no .env / variáveis de ambiente.');
@@ -95,7 +97,6 @@ async function notificarReconexao(userId) {
 }
 
 // ─── SERVIDOR HTTP MÍNIMO (satisfaz o Health Check do Render) ───────────────
-const http = require('http');
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -206,15 +207,6 @@ function resolverGrupos(ag, config) {
 }
 
 async function enviarMensagem(sock, jid, texto, imageUrl, tentativas = 3) {
-  // Força o Baileys a atualizar a lista de participantes deste grupo antes de mandar.
-  // Em grupos recém-criados/recém-entrados, a sessão de criptografia com os
-  // participantes pode não ter sido construída ainda, causando erro "No sessions"
-  // na primeira tentativa de envio. Essa chamada (leitura, não modifica nada)
-  // "acorda" essa construção de sessão antes do sendMessage de verdade.
-  if (jid.endsWith('@g.us')) {
-    try { await sock.groupMetadata(jid); } catch (e) { /* não bloqueia o envio por causa disso */ }
-  }
-
   for (let i = 1; i <= tentativas; i++) {
     try {
       if (imageUrl && imageUrl.startsWith('http')) {
@@ -308,7 +300,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     auth: state,
     version: waVersion, // undefined aqui faz o Baileys cair de volta na versão padrão do pacote
     printQRInTerminal: false,
-    logger: require('pino')({ level: 'silent' }),
+    logger: pino({ level: 'silent' }),
     browser: Browsers.macOS('Chrome')
   });
   sockets.set(userId, sock);
@@ -383,10 +375,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     if (connection === 'close') {
       sockets.delete(userId);
       cancelarJobsUsuario(userId);
-      const codigoMotivo = lastDisconnect?.error?.output?.statusCode;
-      const mensagemMotivo = lastDisconnect?.error?.message;
-      console.log(`🔎 [${userId}] Motivo da desconexão — código: ${codigoMotivo} | mensagem: ${mensagemMotivo}`);
-      const deslogado = codigoMotivo === DisconnectReason.loggedOut;
+      const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
       // Se ainda estamos dentro da janela de um pairing code pendente, essa é a
       // desconexão esperada logo após gerar o código (restartRequired) — não apaga
       // o código que está na tela do usuário, senão o app mostra "desconectado" à toa.
@@ -423,27 +412,6 @@ function monitorarSupabase() {
       const row = payload.new;
       if (!row) return;
       if (row.status === 'requested') {
-        // Salvaguarda: impede que duas contas diferentes tentem usar o MESMO número de
-        // WhatsApp ao mesmo tempo. Foi exatamente isso que causou o incidente de
-        // pareamento em loop de 10/09/2026 — um número ficou "grudado" numa conta antiga
-        // desconectada e entrou em conflito quando outra conta tentou usá-lo.
-        if (row.phone_number) {
-          const { data: conflito } = await supabase
-            .from('bot_status')
-            .select('user_id')
-            .eq('phone_number', row.phone_number)
-            .neq('user_id', row.user_id)
-            .in('status', ['connected', 'pairing', 'qr', 'iniciando'])
-            .maybeSingle();
-          if (conflito) {
-            console.error(`🚫 [${row.user_id}] Número ${row.phone_number} já está em uso por outra conta (${conflito.user_id}). Conexão bloqueada.`);
-            await supabase.from('bot_status').upsert({
-              user_id: row.user_id, status: 'numero_em_uso', qr_code: null, pairing_code: null,
-              updated_at: new Date().toISOString()
-            });
-            return;
-          }
-        }
         const socketPreso = sockets.get(row.user_id);
         if (socketPreso) {
           // Invalida os handlers do socket antigo JÁ, antes mesmo dele terminar de se
@@ -453,6 +421,7 @@ function monitorarSupabase() {
           sockets.delete(row.user_id);
         }
         pairingPendente.delete(row.user_id); // pedido explícito de nova tentativa: libera gerar código novo
+
         if (aindaAquecendo()) {
           const faltam = AQUECIMENTO_MS - (Date.now() - SERVER_START);
           console.log(`🔥 [${row.user_id}] Servidor ainda aquecendo, adiando conexão em ${Math.ceil(faltam / 1000)}s...`);
@@ -477,7 +446,6 @@ function monitorarSupabase() {
         pairingPendente.delete(row.user_id);
         await supabase.from('bot_status').upsert({
           user_id: row.user_id, status: 'disconnected', qr_code: null, pairing_code: null,
-          phone_number: null, connection_method: 'qr',
           updated_at: new Date().toISOString()
         });
         await supabase.from('bot_auth_state').delete().eq('user_id', row.user_id);
