@@ -452,4 +452,64 @@ function monitorarSupabase() {
             iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
           }, faltam + 500);
         } else {
-          iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.
+          iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+        }
+      }
+      if (row.status === 'disconnect_requested') {
+        const sock = sockets.get(row.user_id);
+        if (sock) {
+          socketGeracao.set(row.user_id, (socketGeracao.get(row.user_id) || 0) + 1);
+          try { await sock.logout(); } catch (e) { console.error(`❌ [${row.user_id}] Erro ao desconectar:`, e.message); }
+          sockets.delete(row.user_id);
+        }
+        pairingPendente.delete(row.user_id);
+        await supabase.from('bot_status').upsert({
+          user_id: row.user_id, status: 'disconnected', qr_code: null, pairing_code: null,
+          phone_number: null, connection_method: 'qr',
+          updated_at: new Date().toISOString()
+        });
+        await supabase.from('bot_auth_state').delete().eq('user_id', row.user_id);
+      }
+    })
+    .subscribe((status) => console.log(`📡 [bot_status] Realtime: ${status}`));
+
+  supabase
+    .channel('vendabot-config-changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, (p) => recarregarUsuario(p))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, (p) => recarregarUsuario(p))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, (p) => recarregarUsuario(p))
+    .subscribe((status) => console.log(`📡 [config] Realtime: ${status}`));
+
+  function recarregarUsuario(payload) {
+    const userId = (payload.new && payload.new.user_id) || (payload.old && payload.old.user_id);
+    if (userId && sockets.has(userId)) {
+      console.log(`🔄 [${userId}] Config mudou, reagendando...`);
+      agendarMensagensUsuario(userId);
+    }
+  }
+}
+
+// ─── AO LIGAR: RECONECTA AUTOMATICAMENTE QUEM JÁ ESTAVA CONECTADO ───────────
+async function reconectarUsuariosExistentes() {
+  const { data, error } = await supabase
+    .from('bot_status')
+    .select('user_id, connection_method, phone_number')
+    .in('status', ['connected', 'qr', 'requested', 'pairing']);
+
+  if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
+
+  for (const row of data || []) {
+    await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+  }
+  console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
+}
+
+process.on('uncaughtException', e => console.error('🔴 ERRO:', e.message));
+process.on('unhandledRejection', e => console.error('🔴 ERRO PROMISE:', e.message || e));
+
+console.log('🤖 VendaBot multi-tenant iniciando...\n');
+monitorarSupabase();
+setTimeout(() => {
+  console.log('🔥 Aquecimento concluído, reconectando usuários existentes...');
+  reconectarUsuariosExistentes();
+}, AQUECIMENTO_MS);
