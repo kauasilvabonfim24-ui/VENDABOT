@@ -411,6 +411,27 @@ function monitorarSupabase() {
       const row = payload.new;
       if (!row) return;
       if (row.status === 'requested') {
+        // Salvaguarda: impede que duas contas diferentes tentem usar o MESMO número de
+        // WhatsApp ao mesmo tempo. Foi exatamente isso que causou o incidente de
+        // pareamento em loop de 10/09/2026 — um número ficou "grudado" numa conta antiga
+        // desconectada e entrou em conflito quando outra conta tentou usá-lo.
+        if (row.phone_number) {
+          const { data: conflito } = await supabase
+            .from('bot_status')
+            .select('user_id')
+            .eq('phone_number', row.phone_number)
+            .neq('user_id', row.user_id)
+            .in('status', ['connected', 'pairing', 'qr', 'iniciando'])
+            .maybeSingle();
+          if (conflito) {
+            console.error(`🚫 [${row.user_id}] Número ${row.phone_number} já está em uso por outra conta (${conflito.user_id}). Conexão bloqueada.`);
+            await supabase.from('bot_status').upsert({
+              user_id: row.user_id, status: 'numero_em_uso', qr_code: null, pairing_code: null,
+              updated_at: new Date().toISOString()
+            });
+            return;
+          }
+        }
         const socketPreso = sockets.get(row.user_id);
         if (socketPreso) {
           // Invalida os handlers do socket antigo JÁ, antes mesmo dele terminar de se
@@ -431,63 +452,4 @@ function monitorarSupabase() {
             iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
           }, faltam + 500);
         } else {
-          iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
-        }
-      }
-      if (row.status === 'disconnect_requested') {
-        const sock = sockets.get(row.user_id);
-        if (sock) {
-          socketGeracao.set(row.user_id, (socketGeracao.get(row.user_id) || 0) + 1);
-          try { await sock.logout(); } catch (e) { console.error(`❌ [${row.user_id}] Erro ao desconectar:`, e.message); }
-          sockets.delete(row.user_id);
-        }
-        pairingPendente.delete(row.user_id);
-        await supabase.from('bot_status').upsert({
-          user_id: row.user_id, status: 'disconnected', qr_code: null, pairing_code: null,
-          updated_at: new Date().toISOString()
-        });
-        await supabase.from('bot_auth_state').delete().eq('user_id', row.user_id);
-      }
-    })
-    .subscribe((status) => console.log(`📡 [bot_status] Realtime: ${status}`));
-
-  supabase
-    .channel('vendabot-config-changes')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, (p) => recarregarUsuario(p))
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, (p) => recarregarUsuario(p))
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, (p) => recarregarUsuario(p))
-    .subscribe((status) => console.log(`📡 [config] Realtime: ${status}`));
-
-  function recarregarUsuario(payload) {
-    const userId = (payload.new && payload.new.user_id) || (payload.old && payload.old.user_id);
-    if (userId && sockets.has(userId)) {
-      console.log(`🔄 [${userId}] Config mudou, reagendando...`);
-      agendarMensagensUsuario(userId);
-    }
-  }
-}
-
-// ─── AO LIGAR: RECONECTA AUTOMATICAMENTE QUEM JÁ ESTAVA CONECTADO ───────────
-async function reconectarUsuariosExistentes() {
-  const { data, error } = await supabase
-    .from('bot_status')
-    .select('user_id, connection_method, phone_number')
-    .in('status', ['connected', 'qr', 'requested', 'pairing']);
-
-  if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
-
-  for (const row of data || []) {
-    await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
-  }
-  console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
-}
-
-process.on('uncaughtException', e => console.error('🔴 ERRO:', e.message));
-process.on('unhandledRejection', e => console.error('🔴 ERRO PROMISE:', e.message || e));
-
-console.log('🤖 VendaBot multi-tenant iniciando...\n');
-monitorarSupabase();
-setTimeout(() => {
-  console.log('🔥 Aquecimento concluído, reconectando usuários existentes...');
-  reconectarUsuariosExistentes();
-}, AQUECIMENTO_MS);
+          iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.
