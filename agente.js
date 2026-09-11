@@ -200,4 +200,4 @@ function gerarParaHorario(produtos, hora, nomeGrupo) {
   return gerarParaGrupo(produtos, hora, nomeGrupo || '', nomeGrupo || '', null);
 }
 
-module.exports = { gerarParaGrupo, gerarParaHorario, calcularDesconto };
+export { gerarParaGrupo, gerarParaHorario, calcularDesconto };
