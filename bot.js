@@ -73,27 +73,26 @@ async function obterVersaoWhatsApp(userId) {
 
 // ─── NOTIFICAÇÃO PUSH (OneSignal via Edge Function send-push) ──────────────
 // Não quebra o bot se faltar a env var ou se a chamada falhar — só loga o erro.
-async function notificarReconexao(userId) {
+async function enviarNotificacaoPush(userId, title, message) {
   if (!process.env.INTERNAL_TRIGGER_SECRET) {
-    console.warn(`⚠️ [${userId}] INTERNAL_TRIGGER_SECRET não configurado no Render — pulando notificação de reconexão.`);
+    console.warn(`⚠️ [${userId}] INTERNAL_TRIGGER_SECRET não configurado no Render — pulando notificação.`);
     return;
   }
   try {
     const resp = await fetch(`${process.env.SUPABASE_URL}/functions/v1/send-push`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        secret: process.env.INTERNAL_TRIGGER_SECRET,
-        user_id: userId,
-        title: 'Bot reconectado ✅',
-        message: 'Seu WhatsApp voltou a ficar conectado e já está enviando mensagens normalmente.'
-      })
+      body: JSON.stringify({ secret: process.env.INTERNAL_TRIGGER_SECRET, user_id: userId, title, message })
     });
     const result = await resp.json().catch(() => null);
-    console.log(`🔔 [${userId}] Notificação de reconexão: ${resp.ok ? 'enviada' : 'falhou'}`, result || '');
+    console.log(`🔔 [${userId}] Notificação (${title}): ${resp.ok ? 'enviada' : 'falhou'}`, result || '');
   } catch (e) {
-    console.error(`❌ [${userId}] Erro ao notificar reconexão:`, e.message);
+    console.error(`❌ [${userId}] Erro ao notificar (${title}):`, e.message);
   }
+}
+
+async function notificarReconexao(userId) {
+  await enviarNotificacaoPush(userId, 'Bot reconectado ✅', 'Seu WhatsApp voltou a ficar conectado e já está enviando mensagens normalmente.');
 }
 
 // ─── SERVIDOR HTTP MÍNIMO (satisfaz o Health Check do Render) ───────────────
@@ -206,7 +205,16 @@ function resolverGrupos(ag, config) {
   return ids;
 }
 
+// Reconhece o padrão de erro que o WhatsApp devolve quando o bot tenta mandar
+// mensagem num grupo onde só administradores podem postar (bot é membro comum).
+function ehErroDePermissao(e) {
+  const codigo = e?.output?.statusCode;
+  const msg = (e?.message || '').toLowerCase();
+  return codigo === 403 || msg.includes('forbidden') || msg.includes('not-authorized') || msg.includes('not authorized');
+}
+
 async function enviarMensagem(sock, jid, texto, imageUrl, tentativas = 3) {
+  let ultimoErro = null;
   for (let i = 1; i <= tentativas; i++) {
     try {
       if (imageUrl && imageUrl.startsWith('http')) {
@@ -214,13 +222,15 @@ async function enviarMensagem(sock, jid, texto, imageUrl, tentativas = 3) {
       } else {
         await sock.sendMessage(jid, { text: texto });
       }
-      return true;
+      return { ok: true, error: null, semPermissao: false };
     } catch (e) {
+      ultimoErro = e;
       console.error(`   ⚠️  Tentativa ${i}/${tentativas} falhou: ${e.message}`);
+      if (ehErroDePermissao(e)) break; // sem permissão não resolve tentando de novo
       if (i < tentativas) await new Promise(r => setTimeout(r, 2000));
     }
   }
-  return false;
+  return { ok: false, error: ultimoErro?.message || 'Erro desconhecido', semPermissao: ehErroDePermissao(ultimoErro || {}) };
 }
 
 function cancelarJobsUsuario(userId) {
@@ -269,8 +279,25 @@ async function agendarMensagensUsuario(userId) {
         const resultado = agente.gerarParaGrupo(configAtual.products, hora, nomeGrupoAtual, grupoIdAtual, categoriaForcada);
         if (!resultado) continue;
 
-        const ok = await enviarMensagem(sock, id, resultado.mensagem, resultado.imageUrl);
-        console.log(`   [${userId}] ${ok ? '✅ Enviado' : '❌ Falhou'}: ${nomeGrupoAtual}`);
+        const resultado2 = await enviarMensagem(sock, id, resultado.mensagem, resultado.imageUrl);
+        console.log(`   [${userId}] ${resultado2.ok ? '✅ Enviado' : '❌ Falhou'}: ${nomeGrupoAtual}`);
+
+        await supabase.from('message_logs').insert({
+          user_id: userId,
+          group_id: grupoIdAtual,
+          group_name: nomeGrupoAtual,
+          status: resultado2.ok ? 'enviado' : 'erro',
+          error_message: resultado2.ok ? null : resultado2.error
+        });
+
+        if (!resultado2.ok && resultado2.semPermissao) {
+          await enviarNotificacaoPush(
+            userId,
+            'Mensagem não enviada ⚠️',
+            `Não conseguimos mandar mensagem no grupo "${nomeGrupoAtual}". Verifique se o bot ainda é participante e se o grupo permite que qualquer participante envie mensagens (grupos com "somente admins" bloqueiam o bot).`
+          );
+        }
+
         await new Promise(r => setTimeout(r, 4000));
       }
     });
