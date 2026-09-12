@@ -23,6 +23,10 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const sockets = new Map();       // user_id -> socket Baileys ativo
 const jobsPorUsuario = new Map(); // user_id -> array de jobs agendados
 const pairingPendente = new Set(); // user_id -> já pediu código de pareamento nessa rodada, aguardando o usuário digitar
+const pairingCodigoGeradoEm = new Map(); // user_id -> timestamp de quando o último código de pareamento foi emitido
+const pairingFalhasRapidas = new Map(); // user_id -> quantas vezes seguidas a conexão caiu rápido demais após o código (ver PAIRING_FALHA_RAPIDA_MS)
+const PAIRING_FALHA_RAPIDA_MS = 20000; // menos que isso entre "código emitido" e "caiu" é cedo demais pra ser o usuário digitando errado/desistindo
+const PAIRING_MAX_TENTATIVAS_AUTOMATICAS = 3; // depois de N quedas rápidas seguidas, desiste de verdade e avisa o usuário
 const reconectandoAposQueda = new Set(); // user_id -> caiu e está no meio da reconexão automática (pra notificar só quando voltar)
 const socketGeracao = new Map(); // user_id -> número da tentativa de conexão atual. Todo socket novo incrementa esse
 // número; os handlers de eventos do socket ANTERIOR (que pode levar alguns segundos pra
@@ -93,6 +97,14 @@ async function enviarNotificacaoPush(userId, title, message) {
 
 async function notificarReconexao(userId) {
   await enviarNotificacaoPush(userId, 'Bot reconectado ✅', 'Seu WhatsApp voltou a ficar conectado e já está enviando mensagens normalmente.');
+}
+
+async function notificarPrimeiroEnvio(userId, nomeGrupo) {
+  await enviarNotificacaoPush(
+    userId,
+    'Primeira mensagem enviada! 🎉',
+    `Sua primeira oferta já saiu com sucesso no grupo "${nomeGrupo}". O VendaBot está funcionando e vai continuar disparando nos horários que você configurou.`
+  );
 }
 
 // ─── SERVIDOR HTTP MÍNIMO (satisfaz o Health Check do Render) ───────────────
@@ -290,6 +302,20 @@ async function agendarMensagensUsuario(userId) {
           error_message: resultado2.ok ? null : resultado2.error
         });
 
+        if (resultado2.ok) {
+          const { count } = await supabase
+            .from('message_logs')
+            .select('id', { count: 'exact', head: true })
+            .eq('user_id', userId)
+            .eq('status', 'enviado');
+          if (count === 1) {
+            // Primeira mensagem que esse usuário já conseguiu enviar de verdade —
+            // notifica na hora, pra ele ver logo que o bot está funcionando de
+            // fato (em vez de ficar sem noticia nenhuma até o próximo horário).
+            await notificarPrimeiroEnvio(userId, nomeGrupoAtual);
+          }
+        }
+
         if (!resultado2.ok && resultado2.semPermissao) {
           await enviarNotificacaoPush(
             userId,
@@ -347,6 +373,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
         const numeroLimpo = telefone.replace(/\D/g, '');
         const code = await sock.requestPairingCode(numeroLimpo);
         pairingPendente.add(userId);
+        pairingCodigoGeradoEm.set(userId, Date.now());
         console.log(`🔑 [${userId}] Código de pareamento: ${code}`);
         await supabase.from('bot_status').upsert({
           user_id: userId, status: 'pairing', pairing_code: code, qr_code: null,
@@ -378,6 +405,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
 
     if (connection === 'open') {
       pairingPendente.delete(userId);
+      pairingFalhasRapidas.delete(userId);
       console.log(`✅ [${userId}] CONECTADO!`);
       await supabase.from('bot_status').upsert({
         user_id: userId, status: 'connected', qr_code: null, updated_at: new Date().toISOString()
@@ -403,24 +431,53 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       sockets.delete(userId);
       cancelarJobsUsuario(userId);
       const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
-      // Se ainda estamos dentro da janela de um pairing code pendente, essa é a
-      // desconexão esperada logo após gerar o código (restartRequired) — não apaga
-      // o código que está na tela do usuário, senão o app mostra "desconectado" à toa.
-      const aguardandoDigitacao = metodo === 'pairing' && pairingPendente.has(userId) && !deslogado;
+
+      // No pareamento, o WhatsApp às vezes derruba a conexão com o MESMO código de
+      // "logout" (401) só alguns segundos depois de emitir o código — antes de dar
+      // tempo real da pessoa nem abrir o WhatsApp pra digitar. Tratar isso como logout
+      // de verdade (que apaga a sessão salva) jogava o usuário num loop de "gera código
+      // -> cai sozinho -> gera outro código -> cai de novo". Por isso só tratamos como
+      // logout definitivo se: não é pareamento, OU já demorou tempo suficiente pra ser
+      // uma rejeição de verdade, OU já tentamos de novo automaticamente demais.
+      const geradoEm = pairingCodigoGeradoEm.get(userId) || 0;
+      const caiuRapidoDemaisAposCodigo = metodo === 'pairing' && (Date.now() - geradoEm) < PAIRING_FALHA_RAPIDA_MS;
+      const tentativasRapidas = pairingFalhasRapidas.get(userId) || 0;
+      const tentarDeNovoSemApagar = deslogado && caiuRapidoDemaisAposCodigo && tentativasRapidas < PAIRING_MAX_TENTATIVAS_AUTOMATICAS;
+      const deslogadoDeVerdade = deslogado && !tentarDeNovoSemApagar;
+
+      // Se ainda estamos dentro da janela de um pairing code pendente (e não é um
+      // logout de verdade), essa é a desconexão esperada logo após gerar o código —
+      // não apaga o código que está na tela do usuário, senão o app mostra
+      // "desconectado" à toa enquanto a pessoa ainda está tentando digitar.
+      const aguardandoDigitacao = metodo === 'pairing' && pairingPendente.has(userId) && !deslogadoDeVerdade;
       if (!aguardandoDigitacao) {
         await supabase.from('bot_status').upsert({
           user_id: userId, status: 'disconnected', qr_code: null, pairing_code: null,
           updated_at: new Date().toISOString()
         });
       }
-      if (!deslogado) {
-        console.log(`🔄 [${userId}] Reconectando em 5s...`);
+      if (!deslogadoDeVerdade) {
+        if (tentarDeNovoSemApagar) {
+          pairingFalhasRapidas.set(userId, tentativasRapidas + 1);
+          pairingPendente.delete(userId); // libera gerar um código novo na próxima tentativa
+          console.log(`🔁 [${userId}] Pareamento caiu rápido demais (tentativa ${tentativasRapidas + 1}/${PAIRING_MAX_TENTATIVAS_AUTOMATICAS}), tentando de novo sem apagar a sessão...`);
+        } else {
+          console.log(`🔄 [${userId}] Reconectando em 5s...`);
+        }
         reconectandoAposQueda.add(userId);
         setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 5000);
       } else {
         console.log(`❌ [${userId}] Sessão encerrada (logout). Limpando sessão salva...`);
         pairingPendente.delete(userId);
+        pairingFalhasRapidas.delete(userId);
         await supabase.from('bot_auth_state').delete().eq('user_id', userId);
+        if (metodo === 'pairing' && deslogado) {
+          await enviarNotificacaoPush(
+            userId,
+            'Não foi possível conectar por número ⚠️',
+            'Tivemos dificuldade pra conectar usando o código por número dessa vez. Tente novamente ou use a conexão por QR code, que costuma ser mais estável.'
+          );
+        }
       }
     }
   });
@@ -448,6 +505,7 @@ function monitorarSupabase() {
           sockets.delete(row.user_id);
         }
         pairingPendente.delete(row.user_id); // pedido explícito de nova tentativa: libera gerar código novo
+        pairingFalhasRapidas.delete(row.user_id); // conta as tentativas automáticas do zero de novo
 
         if (aindaAquecendo()) {
           const faltam = AQUECIMENTO_MS - (Date.now() - SERVER_START);
