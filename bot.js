@@ -455,10 +455,19 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       // -> cai sozinho -> gera outro código -> cai de novo". Por isso só tratamos como
       // logout definitivo se: não é pareamento, OU já demorou tempo suficiente pra ser
       // uma rejeição de verdade, OU já tentamos de novo automaticamente demais.
+      // Cair ANTES de sequer gerar um código de pareamento é mais claramente
+      // ainda "não foi o usuário" do que cair rápido demais depois do código —
+      // a pessoa nem teve chance de digitar nada ainda. Antes, esse caso caía
+      // no "senão" (rejeição definitiva) por engano, porque sem nenhum código
+      // emitido nessa rodada o cálculo de "tempo desde o código" comparava com
+      // a época Unix (1970) e nunca dava "cedo demais". Isso obrigava a pessoa
+      // a clicar em "Gerar novo código" na mão pra conseguir uma segunda
+      // tentativa, quando o bot já podia ter tentado de novo sozinho.
+      const semCodigoAindaEmitidoNessaRodada = metodo === 'pairing' && !pairingCodigoGeradoEm.has(userId);
       const geradoEm = pairingCodigoGeradoEm.get(userId) || 0;
-      const caiuRapidoDemaisAposCodigo = metodo === 'pairing' && (Date.now() - geradoEm) < PAIRING_FALHA_RAPIDA_MS;
+      const caiuRapidoDemaisAposCodigo = metodo === 'pairing' && geradoEm > 0 && (Date.now() - geradoEm) < PAIRING_FALHA_RAPIDA_MS;
       const tentativasRapidas = pairingFalhasRapidas.get(userId) || 0;
-      const tentarDeNovoSemApagar = deslogado && caiuRapidoDemaisAposCodigo && tentativasRapidas < PAIRING_MAX_TENTATIVAS_AUTOMATICAS;
+      const tentarDeNovoSemApagar = deslogado && (semCodigoAindaEmitidoNessaRodada || caiuRapidoDemaisAposCodigo) && tentativasRapidas < PAIRING_MAX_TENTATIVAS_AUTOMATICAS;
       const deslogadoDeVerdade = deslogado && !tentarDeNovoSemApagar;
 
       // Se ainda estamos dentro da janela de um pairing code pendente (e não é um
@@ -522,6 +531,7 @@ function monitorarSupabase() {
         }
         pairingPendente.delete(row.user_id); // pedido explícito de nova tentativa: libera gerar código novo
         pairingFalhasRapidas.delete(row.user_id); // conta as tentativas automáticas do zero de novo
+        pairingCodigoGeradoEm.delete(row.user_id); // essa é uma sessão nova: nenhum código foi emitido ainda nela
 
         if (aindaAquecendo()) {
           const faltam = AQUECIMENTO_MS - (Date.now() - SERVER_START);
@@ -581,6 +591,13 @@ async function reconectarUsuariosExistentes() {
 
   for (const row of data || []) {
     await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+    // Espaça as reconexões no boot — cada handshake do Baileys usa bastante
+    // CPU (criptografia do Signal Protocol), e o plano Free do Render só dá
+    // 0.15 vCPU pro processo inteiro. Reconectar todo mundo ao mesmo tempo
+    // sufoca esse processador fraco, o que pode inclusive disparar o
+    // watchdog de auto-cura logo abaixo (achando que o processo travou) e
+    // gerar um loop de reinício repetido — visto na prática em 13/09/2026.
+    await new Promise(r => setTimeout(r, 3000));
   }
   console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
 }
