@@ -1,6 +1,22 @@
 // ╔══════════════════════════════════════════════════════════════╗
-// ║   AGENTE IA KAUÃ v3 — Inteligente, sem repetição           ║
+// ║   AGENTE IA KAUÃ v4 — Inteligente, sem repetição             ║
+// ║   (corrigido: match de categoria ignora acento + diversifica ║
+// ║    produto entre grupos diferentes no mesmo disparo)         ║
 // ╚══════════════════════════════════════════════════════════════╝
+
+// ─── NORMALIZAÇÃO DE TEXTO (ignora acento/maiúsculas na comparação) ─────────
+// Antes, comparávamos texto acentuado ("Relógio", "Sandália") contra
+// palavras-chave sem acento ("relogio", "sandalia") e a maioria não batia —
+// isso fazia sobrar só 1 produto "por sorte" em várias faixas de horário, e
+// esse único produto acabava sendo mandado pra TODOS os grupos naquele
+// disparo. Normalizando os dois lados (removendo acento e caixa) antes de
+// comparar, o match fica correto de verdade.
+function normalizar(str) {
+  return String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
 
 // ─── SAUDAÇÃO POR HORA ───────────────────────────────────────────────────────
 function getSaudacao(hora) {
@@ -33,7 +49,7 @@ const COPYS_MOTOBOY = [
   `🪖 *EQUIPAMENTO BOM E BARATO!* 🪖\n🏍️ *{NOME}*\n❌ De: ~~R$ {PRECO_ANTIGO}~~\n✅ Hoje por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Segurança e economia andam juntas!\n👉 {LINK}`
 ];
 
-// ─── CATEGORIAS POR HORÁRIO ──────────────────────────────────────────────────
+// ─── CATEGORIAS POR HORÁRIO (comparadas já sem acento, ver normalizar()) ────
 const HORARIOS = {
   manha:   { min: 7,  max: 10, cats: ['uso diario','cafeteira','termica','mochila','tenis','roupa','smartwatch','fone','maquiagem','escova','kit'] },
   almoco:  { min: 11, max: 14, cats: ['impulso','capinha','power bank','carregador','bijuteria','bolsa','bone','sandalia','chinelo','relogio'] },
@@ -75,13 +91,14 @@ function calcularDesconto(precoAntigo, precoAtual) {
 
 function isMotoboy(produto) {
   const palavras = ['motoboy','moto','delivery','capacete','luva','jaqueta','bag delivery','suporte celular','capa chuva','bota moto','cadeado moto','farol','buzina','retrovisor'];
-  const texto = ((produto.category || '') + ' ' + (produto.name || '')).toLowerCase();
-  return palavras.some(c => texto.includes(c));
+  const texto = normalizar((produto.category || '') + ' ' + (produto.name || ''));
+  return palavras.some(c => texto.includes(normalizar(c)));
 }
 
 function isGrupoMotoboy(nomeGrupo) {
   const palavras = ['motoboy','moto','delivery','motoca','piloto','rider','capacete'];
-  return palavras.some(p => (nomeGrupo || '').toLowerCase().includes(p));
+  const texto = normalizar(nomeGrupo);
+  return palavras.some(p => texto.includes(normalizar(p)));
 }
 
 function getCategoriasPorContexto(hora, diaSemana) {
@@ -95,15 +112,37 @@ function getCategoriasPorContexto(hora, diaSemana) {
 }
 
 function produtoMatchCategoria(produto, categorias, categoriaForcada) {
-  const texto = ((produto.category || '') + ' ' + (produto.name || '')).toLowerCase();
+  const texto = normalizar((produto.category || '') + ' ' + (produto.name || ''));
   // Se tem categoria forçada no agendamento, usa ela
-  if (categoriaForcada) return texto.includes(categoriaForcada.toLowerCase());
+  if (categoriaForcada) return texto.includes(normalizar(categoriaForcada));
   // Senão usa categorias do horário
-  return categorias.some(c => texto.includes(c));
+  return categorias.some(c => texto.includes(normalizar(c)));
+}
+
+// Dado um array de produtos já filtrados por uma regra (motoboy, categoria,
+// etc), tenta primeiro achar um que NÃO tenha sido usado nem no histórico
+// recente do grupo (últimos 3) nem já usado NESSE MESMO disparo (outros
+// grupos que já receberam mensagem agora há pouco, no mesmo ciclo do
+// agendamento). Se não sobrar nenhum com essa restrição dupla, relaxa pro
+// histórico do grupo (mantém só a regra de não repetir dentro do mesmo
+// disparo). Se ainda assim não sobrar nada (ex: só existe 1 produto válido no
+// total), aí sim permite repetir — não tem outra opção.
+function semRepetir(lista, hist, usadosNesteCiclo) {
+  if (!lista.length) return lista;
+  const semNadaRepetido = lista.filter(p => !usadosNesteCiclo.has(p.id) && !hist.produtos.slice(-3).includes(p.id));
+  if (semNadaRepetido.length) return semNadaRepetido;
+  const soSemRepetirNesteCiclo = lista.filter(p => !usadosNesteCiclo.has(p.id));
+  if (soSemRepetirNesteCiclo.length) return soSemRepetirNesteCiclo;
+  return lista; // não tem jeito, só sobrou repetir
 }
 
 // ─── ESCOLHER PRODUTO INTELIGENTE ────────────────────────────────────────────
-function escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categoriaForcada) {
+// usadosNesteCiclo: Set com os IDs de produto já escolhidos nesse MESMO disparo
+// (mesmo horário, passando por vários grupos em sequência) — evita que todos
+// os grupos recebam o mesmo produto só porque, individualmente, cada grupo
+// "achava" que aquele produto tava livre no histórico dele.
+function escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categoriaForcada, usadosNesteCiclo) {
+  const ciclo = usadosNesteCiclo || new Set();
   const validos = produtos.filter(p => p.oldPrice && p.price && p.link);
   if (!validos.length) return null;
 
@@ -113,27 +152,26 @@ function escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categori
 
   // 1. Grupo motoboy → só produto motoboy
   if (ehMotoboy) {
-    const motoboys = validos.filter(p => isMotoboy(p) && !hist.produtos.slice(-3).includes(p.id));
+    const motoboys = semRepetir(validos.filter(p => isMotoboy(p)), hist, ciclo);
     if (motoboys.length) return { produto: motoboys[Math.floor(Math.random() * motoboys.length)], tipo: 'motoboy' };
-    // Se não tem produto motoboy, avisa
-    const qualquer = validos.filter(p => !hist.produtos.slice(-3).includes(p.id));
+    // Se não tem produto motoboy, avisa (mas ainda assim tenta não repetir)
+    const qualquer = semRepetir(validos, hist, ciclo);
     if (qualquer.length) return { produto: qualquer[Math.floor(Math.random() * qualquer.length)], tipo: 'motoboy' };
   }
 
   // 2. Categoria forçada pelo agendamento
   if (categoriaForcada) {
-    const porCategoria = validos.filter(p => produtoMatchCategoria(p, [], categoriaForcada) && !hist.produtos.slice(-3).includes(p.id));
+    const porCategoria = semRepetir(validos.filter(p => produtoMatchCategoria(p, [], categoriaForcada)), hist, ciclo);
     if (porCategoria.length) return { produto: porCategoria[Math.floor(Math.random() * porCategoria.length)], tipo: 'geral' };
   }
 
   // 3. Categoria certa pro horário/dia
-  const porHorario = validos.filter(p => produtoMatchCategoria(p, categorias, null) && !hist.produtos.slice(-3).includes(p.id));
+  const porHorario = semRepetir(validos.filter(p => produtoMatchCategoria(p, categorias, null)), hist, ciclo);
   if (porHorario.length) return { produto: porHorario[Math.floor(Math.random() * porHorario.length)], tipo: 'geral' };
 
   // 4. Qualquer produto não repetido
-  const disponiveis = validos.filter(p => !hist.produtos.slice(-3).includes(p.id));
-  const lista = disponiveis.length ? disponiveis : validos;
-  return { produto: lista[Math.floor(Math.random() * lista.length)], tipo: 'geral' };
+  const disponiveis = semRepetir(validos, hist, ciclo);
+  return { produto: disponiveis[Math.floor(Math.random() * disponiveis.length)], tipo: 'geral' };
 }
 
 // ─── ESCOLHER COPY SEM REPETIR ────────────────────────────────────────────────
@@ -169,21 +207,25 @@ function gerarMensagem(produto, tipo, grupoId, hora) {
     .replace(/{DESCONTO_TAG}/g, descontoTag)
     .replace(/{LINK}/g, produto.link);
 
-  return { mensagem, imageUrl: produto.imageUrl || null, produto: produto.name, desconto };
+  return { mensagem, imageUrl: produto.imageUrl || null, produto: produto.name, produtoId: produto.id, desconto };
 }
 
 // ─── FUNÇÃO PRINCIPAL ───────────────────────────────────────────────────────
-function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada) {
+// usadosNesteCiclo (opcional): Set compartilhado entre as chamadas dessa
+// função dentro do MESMO disparo (o bot.js cria um Set novo a cada horário
+// agendado e reaproveita ele pra cada grupo daquela rodada).
+function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada, usadosNesteCiclo) {
   const agora = new Date();
   const diaSemana = agora.getDay();
 
-  const resultado = escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categoriaForcada);
+  const resultado = escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categoriaForcada, usadosNesteCiclo);
   if (!resultado) {
     console.log('⚠️  Agente: Sem produtos válidos. Cadastre produtos com preço antigo e atual!');
     return null;
   }
 
   const msg = gerarMensagem(resultado.produto, resultado.tipo, grupoId, hora);
+  if (usadosNesteCiclo) usadosNesteCiclo.add(msg.produtoId);
 
   const dias = ['Dom','Seg','Ter','Qua','Qui','Sex','Sab'];
   console.log(`🧠 Agente → Grupo: "${nomeGrupo}"`);
@@ -197,7 +239,7 @@ function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada) {
 
 // Mantém compatibilidade com versão anterior
 function gerarParaHorario(produtos, hora, nomeGrupo) {
-  return gerarParaGrupo(produtos, hora, nomeGrupo || '', nomeGrupo || '', null);
+  return gerarParaGrupo(produtos, hora, nomeGrupo || '', nomeGrupo || '', null, null);
 }
 
 export { gerarParaGrupo, gerarParaHorario, calcularDesconto };
