@@ -552,14 +552,14 @@ function monitorarSupabase() {
         await supabase.from('bot_auth_state').delete().eq('user_id', row.user_id);
       }
     })
-    .subscribe((status) => console.log(`📡 [bot_status] Realtime: ${status}`));
+    .subscribe((status) => tratarStatusCanal('bot_status', status));
 
   supabase
     .channel('vendabot-config-changes')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, (p) => recarregarUsuario(p))
     .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, (p) => recarregarUsuario(p))
     .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, (p) => recarregarUsuario(p))
-    .subscribe((status) => console.log(`📡 [config] Realtime: ${status}`));
+    .subscribe((status) => tratarStatusCanal('config', status));
 
   function recarregarUsuario(payload) {
     const userId = (payload.new && payload.new.user_id) || (payload.old && payload.old.user_id);
@@ -579,25 +579,51 @@ async function reconectarUsuariosExistentes() {
 
   if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
 
-  // Espaçamento entre reconexões: o plano free do Render dá só 0,15 de CPU pro
-  // processo inteiro, e o handshake do Baileys (criptografia da sessão) consome
-  // CPU de verdade. Se dois ou mais usuários reconectam no MESMO instante do
-  // boot, o pico de CPU somado estoura esse teto, o health check do Render fica
-  // sem resposta a tempo, e o Render entende que o serviço travou e reinicia ele
-  // sozinho — bem no meio de um pareamento ainda não confirmado, derrubando a
-  // sessão que ainda nem tinha terminado de nascer. Dar um respiro entre cada
-  // reconexão evita que os picos de CPU se somem.
-  const ESPACAMENTO_RECONEXAO_MS = 4000;
-  const usuarios = data || [];
-  for (let i = 0; i < usuarios.length; i++) {
-    const row = usuarios[i];
+  for (const row of data || []) {
     await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
-    if (i < usuarios.length - 1) {
-      await new Promise(r => setTimeout(r, ESPACAMENTO_RECONEXAO_MS));
+  }
+  console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
+}
+
+// ─── AUTO-CURA: reinicia sozinho quando o processo trava de verdade ────────
+// O Render só reinicia automaticamente quando o processo CRASHA — não quando
+// ele fica "vivo" mas mudo (ex: o Realtime do Supabase caiu e parou de reagir
+// a pedidos de conexão, só que o servidor HTTP continua respondendo 200 numa
+// rota que nem checa isso). Foi exatamente isso que aconteceu no incidente de
+// hoje: precisou de um humano notar e clicar em "Manual Deploy". As duas
+// checagens abaixo transformam esse tipo de trava silenciosa num crash de
+// verdade — e cada crash o Render sobe uma instância nova sozinho, em
+// segundos, sem precisar de ninguém notando ou clicando em nada.
+
+function tratarStatusCanal(nomeCanal, status) {
+  console.log(`📡 [${nomeCanal}] Realtime: ${status}`);
+  if (status === 'TIMED_OUT' || status === 'CHANNEL_ERROR' || status === 'CLOSED') {
+    console.error(`🔴 [${nomeCanal}] Canal Realtime caiu de vez (${status}). Reiniciando o processo pra o Render subir uma instância limpa...`);
+    setTimeout(() => process.exit(1), 1000); // pequeno atraso só pra garantir que o log acima saia antes do processo morrer
+  }
+}
+
+// Rede de segurança extra: mesmo que o canal Realtime não emita nenhum status
+// de erro explícito (pode simplesmente ficar "SUBSCRIBED" só de nome, mas sem
+// realmente entregar eventos), uma consulta simples ao banco falhando
+// repetidas vezes também é sinal de processo preso/sem rede. Depois de
+// algumas falhas seguidas, mesma solução: mata o processo, Render sobe outro.
+let falhasConsecutivasDeSaude = 0;
+const MAX_FALHAS_DE_SAUDE = 3;
+setInterval(async () => {
+  try {
+    const { error } = await supabase.from('bot_status').select('user_id').limit(1);
+    if (error) throw error;
+    falhasConsecutivasDeSaude = 0;
+  } catch (e) {
+    falhasConsecutivasDeSaude++;
+    console.error(`⚠️ Checagem de saúde falhou (${falhasConsecutivasDeSaude}/${MAX_FALHAS_DE_SAUDE}):`, e.message);
+    if (falhasConsecutivasDeSaude >= MAX_FALHAS_DE_SAUDE) {
+      console.error('🔴 Banco inacessível repetidamente. Reiniciando o processo...');
+      process.exit(1);
     }
   }
-  console.log(`🔁 ${usuarios.length} usuário(s) recarregado(s) ao iniciar.`);
-}
+}, 60000); // a cada 1 minuto
 
 process.on('uncaughtException', e => console.error('🔴 ERRO:', e.message));
 process.on('unhandledRejection', e => console.error('🔴 ERRO PROMISE:', e.message || e));
