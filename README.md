@@ -1,3 +1,4 @@
+[README (1).md](https://github.com/user-attachments/files/32166319/README.1.md)
 [README.md](https://github.com/user-attachments/files/32165433/README.md)
 # VendaBot — Bot WhatsApp
 
