@@ -304,12 +304,18 @@ async function agendarMensagensUsuario(userId) {
       const categoriaForcada = ag.categoria || null;
       const grupos = resolverGrupos(ag, configAtual);
 
+      // Um único Set compartilhado por TODOS os grupos deste disparo — evita
+      // que o agente escolha o mesmo produto pra todo mundo só porque cada
+      // grupo, olhado isoladamente, "achava" que aquele produto tava livre.
+      // Ver comentário detalhado em agente.js (semRepetir).
+      const usadosNesteDisparo = new Set();
+
       for (const id of grupos) {
         const grupoInfo = (configAtual.groups || []).find(g => g.gid === id);
         const nomeGrupoAtual = grupoInfo ? grupoInfo.name : '';
         const grupoIdAtual = grupoInfo ? String(grupoInfo.id) : id;
 
-        const resultado = agente.gerarParaGrupo(configAtual.products, hora, nomeGrupoAtual, grupoIdAtual, categoriaForcada);
+        const resultado = agente.gerarParaGrupo(configAtual.products, hora, nomeGrupoAtual, grupoIdAtual, categoriaForcada, usadosNesteDisparo);
         if (!resultado) continue;
 
         const resultado2 = await enviarMensagem(sock, id, resultado.mensagem, resultado.imageUrl);
