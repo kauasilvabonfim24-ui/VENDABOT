@@ -430,7 +430,23 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     if (connection === 'close') {
       sockets.delete(userId);
       cancelarJobsUsuario(userId);
-      const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
+      const codigoDesconexao = lastDisconnect?.error?.output?.statusCode;
+      const deslogado = codigoDesconexao === DisconnectReason.loggedOut;
+
+      // O WhatsApp costuma exigir um reinício único da conexão logo depois do
+      // primeiro pareamento/QR aceito — às vezes ANTES até do evento 'open'
+      // chegar a disparar, às vezes logo depois. É parte normal do protocolo,
+      // não é queda de verdade. Se deixarmos cair na lógica de baixo, o
+      // bot_status é marcado como "disconnected" à toa por alguns segundos, e
+      // o app pisca de volta pra tela de escolher QR/pareamento (ou nem chega
+      // a mostrar "conectado") mesmo a sessão indo ficar boa logo em seguida.
+      // Por isso tratamos esse código isoladamente: reconecta na hora, sem
+      // tocar em bot_status, sem mexer nos contadores de falha de pareamento.
+      if (codigoDesconexao === DisconnectReason.restartRequired) {
+        console.log(`🔁 [${userId}] Reinício esperado após pareamento/QR, reconectando sem alterar o status...`);
+        setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 1500);
+        return;
+      }
 
       // No pareamento, o WhatsApp às vezes derruba a conexão com o MESMO código de
       // "logout" (401) só alguns segundos depois de emitir o código — antes de dar
