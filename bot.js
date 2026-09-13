@@ -579,10 +579,24 @@ async function reconectarUsuariosExistentes() {
 
   if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
 
-  for (const row of data || []) {
+  // Espaçamento entre reconexões: o plano free do Render dá só 0,15 de CPU pro
+  // processo inteiro, e o handshake do Baileys (criptografia da sessão) consome
+  // CPU de verdade. Se dois ou mais usuários reconectam no MESMO instante do
+  // boot, o pico de CPU somado estoura esse teto, o health check do Render fica
+  // sem resposta a tempo, e o Render entende que o serviço travou e reinicia ele
+  // sozinho — bem no meio de um pareamento ainda não confirmado, derrubando a
+  // sessão que ainda nem tinha terminado de nascer. Dar um respiro entre cada
+  // reconexão evita que os picos de CPU se somem.
+  const ESPACAMENTO_RECONEXAO_MS = 4000;
+  const usuarios = data || [];
+  for (let i = 0; i < usuarios.length; i++) {
+    const row = usuarios[i];
     await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
+    if (i < usuarios.length - 1) {
+      await new Promise(r => setTimeout(r, ESPACAMENTO_RECONEXAO_MS));
+    }
   }
-  console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
+  console.log(`🔁 ${usuarios.length} usuário(s) recarregado(s) ao iniciar.`);
 }
 
 process.on('uncaughtException', e => console.error('🔴 ERRO:', e.message));
