@@ -19,6 +19,27 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
 }
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
+// ─── MODO DO SERVIÇO: QR ou PAIRING ──────────────────────────────────────────
+// Esse mesmo bot.js roda em dois serviços Render diferentes — um só atende
+// conexões por QR Code, o outro só por pairing code (número). Cada serviço
+// descobre qual é o seu papel pela variável de ambiente MODO_CONEXAO, e só
+// escuta/reconecta usuários cujo bot_status.connection_method bate com isso.
+// Exigimos essa variável explicitamente (sem valor padrão silencioso) porque
+// se os dois serviços rodassem no mesmo modo por engano, os dois tentariam
+// controlar os MESMOS usuários ao mesmo tempo — foi exatamente esse tipo de
+// conflito (duas sessões brigando pelo mesmo número) que já causou o bug do
+// "número em uso" resolvido antes. Melhor falhar alto no boot do que duplicar
+// isso silenciosamente.
+const MODO_CONEXAO = (process.env.MODO_CONEXAO || '').toLowerCase();
+if (MODO_CONEXAO !== 'qr' && MODO_CONEXAO !== 'pairing') {
+  console.error("❌ Variável de ambiente MODO_CONEXAO precisa ser 'qr' ou 'pairing'. Configure isso nas Environment Variables do serviço no Render antes de subir.");
+  process.exit(1);
+}
+function pertenceAEsseServico(connectionMethod) {
+  const metodo = connectionMethod || 'qr'; // linhas antigas sem esse campo preenchido contam como 'qr'
+  return metodo === MODO_CONEXAO;
+}
+
 // ─── ESTADO EM MEMÓRIA (por processo) ────────────────────────────────────────
 const sockets = new Map();       // user_id -> socket Baileys ativo
 const jobsPorUsuario = new Map(); // user_id -> array de jobs agendados
@@ -111,8 +132,8 @@ async function notificarPrimeiroEnvio(userId, nomeGrupo) {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end(`VendaBot multi-tenant — ${sockets.size} usuário(s) conectado(s)`);
-}).listen(PORT, () => console.log(`🌐 Servidor HTTP ouvindo na porta ${PORT}`));
+  res.end(`VendaBot multi-tenant [${MODO_CONEXAO.toUpperCase()}] — ${sockets.size} usuário(s) conectado(s)`);
+}).listen(PORT, () => console.log(`🌐 Servidor HTTP ouvindo na porta ${PORT} (modo: ${MODO_CONEXAO.toUpperCase()})`));
 
 // ─── SESSÃO DO WHATSAPP GUARDADA NO SUPABASE (agora por usuário) ────────────
 async function useSupabaseAuthState(userId) {
@@ -520,6 +541,7 @@ function monitorarSupabase() {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_status' }, async (payload) => {
       const row = payload.new;
       if (!row) return;
+      if (!pertenceAEsseServico(row.connection_method)) return; // esse usuário é do outro serviço (QR ou Número) — ignora por completo
       if (row.status === 'requested') {
         const socketPreso = sockets.get(row.user_id);
         if (socketPreso) {
@@ -589,7 +611,9 @@ async function reconectarUsuariosExistentes() {
 
   if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
 
-  for (const row of data || []) {
+  const meusUsuarios = (data || []).filter((row) => pertenceAEsseServico(row.connection_method));
+
+  for (const row of meusUsuarios) {
     await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
     // Espaça as reconexões no boot — cada handshake do Baileys usa bastante
     // CPU (criptografia do Signal Protocol), e o plano Free do Render só dá
@@ -599,7 +623,7 @@ async function reconectarUsuariosExistentes() {
     // gerar um loop de reinício repetido — visto na prática em 13/09/2026.
     await new Promise(r => setTimeout(r, 3000));
   }
-  console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
+  console.log(`🔁 ${meusUsuarios.length} usuário(s) recarregado(s) ao iniciar (modo ${MODO_CONEXAO.toUpperCase()}).`);
 }
 
 // ─── AUTO-CURA: reinicia sozinho quando o processo trava de verdade ────────
@@ -645,7 +669,7 @@ setInterval(async () => {
 process.on('uncaughtException', e => console.error('🔴 ERRO:', e.message));
 process.on('unhandledRejection', e => console.error('🔴 ERRO PROMISE:', e.message || e));
 
-console.log('🤖 VendaBot multi-tenant iniciando...\n');
+console.log(`🤖 VendaBot multi-tenant iniciando... (modo: ${MODO_CONEXAO.toUpperCase()})\n`);
 monitorarSupabase();
 setTimeout(() => {
   console.log('🔥 Aquecimento concluído, reconectando usuários existentes...');
