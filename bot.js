@@ -19,27 +19,6 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
 }
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ─── MODO DO SERVIÇO: QR ou PAIRING ──────────────────────────────────────────
-// Esse mesmo bot.js roda em dois serviços Render diferentes — um só atende
-// conexões por QR Code, o outro só por pairing code (número). Cada serviço
-// descobre qual é o seu papel pela variável de ambiente MODO_CONEXAO, e só
-// escuta/reconecta usuários cujo bot_status.connection_method bate com isso.
-// Exigimos essa variável explicitamente (sem valor padrão silencioso) porque
-// se os dois serviços rodassem no mesmo modo por engano, os dois tentariam
-// controlar os MESMOS usuários ao mesmo tempo — foi exatamente esse tipo de
-// conflito (duas sessões brigando pelo mesmo número) que já causou o bug do
-// "número em uso" resolvido antes. Melhor falhar alto no boot do que duplicar
-// isso silenciosamente.
-const MODO_CONEXAO = (process.env.MODO_CONEXAO || '').toLowerCase();
-if (MODO_CONEXAO !== 'qr' && MODO_CONEXAO !== 'pairing') {
-  console.error("❌ Variável de ambiente MODO_CONEXAO precisa ser 'qr' ou 'pairing'. Configure isso nas Environment Variables do serviço no Render antes de subir.");
-  process.exit(1);
-}
-function pertenceAEsseServico(connectionMethod) {
-  const metodo = connectionMethod || 'qr'; // linhas antigas sem esse campo preenchido contam como 'qr'
-  return metodo === MODO_CONEXAO;
-}
-
 // ─── ESTADO EM MEMÓRIA (por processo) ────────────────────────────────────────
 const sockets = new Map();       // user_id -> socket Baileys ativo
 const jobsPorUsuario = new Map(); // user_id -> array de jobs agendados
@@ -132,8 +111,8 @@ async function notificarPrimeiroEnvio(userId, nomeGrupo) {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end(`VendaBot multi-tenant [${MODO_CONEXAO.toUpperCase()}] — ${sockets.size} usuário(s) conectado(s)`);
-}).listen(PORT, () => console.log(`🌐 Servidor HTTP ouvindo na porta ${PORT} (modo: ${MODO_CONEXAO.toUpperCase()})`));
+  res.end(`VendaBot multi-tenant — ${sockets.size} usuário(s) conectado(s)`);
+}).listen(PORT, () => console.log(`🌐 Servidor HTTP ouvindo na porta ${PORT}`));
 
 // ─── SESSÃO DO WHATSAPP GUARDADA NO SUPABASE (agora por usuário) ────────────
 async function useSupabaseAuthState(userId) {
@@ -304,18 +283,12 @@ async function agendarMensagensUsuario(userId) {
       const categoriaForcada = ag.categoria || null;
       const grupos = resolverGrupos(ag, configAtual);
 
-      // Um único Set compartilhado por TODOS os grupos deste disparo — evita
-      // que o agente escolha o mesmo produto pra todo mundo só porque cada
-      // grupo, olhado isoladamente, "achava" que aquele produto tava livre.
-      // Ver comentário detalhado em agente.js (semRepetir).
-      const usadosNesteDisparo = new Set();
-
       for (const id of grupos) {
         const grupoInfo = (configAtual.groups || []).find(g => g.gid === id);
         const nomeGrupoAtual = grupoInfo ? grupoInfo.name : '';
         const grupoIdAtual = grupoInfo ? String(grupoInfo.id) : id;
 
-        const resultado = agente.gerarParaGrupo(configAtual.products, hora, nomeGrupoAtual, grupoIdAtual, categoriaForcada, usadosNesteDisparo);
+        const resultado = agente.gerarParaGrupo(configAtual.products, hora, nomeGrupoAtual, grupoIdAtual, categoriaForcada);
         if (!resultado) continue;
 
         const resultado2 = await enviarMensagem(sock, id, resultado.mensagem, resultado.imageUrl);
@@ -362,42 +335,6 @@ async function agendarMensagensUsuario(userId) {
   console.log(`⏰ [${userId}] ${novosJobs.length} horário(s) ativo(s)`);
 }
 
-// ─── SINCRONIZAR LISTA DE GRUPOS (só quando realmente precisa) ──────────────
-// groupFetchAllParticipating() é uma das chamadas mais pesadas de CPU do
-// Baileys (busca e decodifica metadata de TODOS os grupos do usuário). Fazer
-// isso toda vez que a conexão abre — inclusive em reconexões automáticas após
-// queda — foi um dos maiores contribuintes pro CPU estourar o teto de 0.15
-// vCPU do Render Free logo depois de cada reconexão, alimentando um loop de
-// reinício (ver comentário em makeWASocket acima). A lista de grupos raramente
-// muda de um minuto pro outro, então só vale a pena buscar de novo se os dados
-// salvos já estiverem velhos de verdade.
-const GRUPOS_SYNC_CACHE_MS = 6 * 60 * 60 * 1000; // 6 horas
-async function sincronizarGruposSeNecessario(userId, sock) {
-  try {
-    const { data, error } = await supabase
-      .from('whatsapp_groups_available')
-      .select('updated_at')
-      .eq('user_id', userId)
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (!error && data && (Date.now() - new Date(data.updated_at).getTime()) < GRUPOS_SYNC_CACHE_MS) {
-      console.log(`💾 [${userId}] Lista de grupos ainda recente, pulando busca pesada (economiza CPU).`);
-      return;
-    }
-
-    const grupos = await sock.groupFetchAllParticipating();
-    const registros = Object.entries(grupos).map(([id, g]) => ({
-      user_id: userId, gid: id, name: g.subject, updated_at: new Date().toISOString()
-    }));
-    if (registros.length) await supabase.from('whatsapp_groups_available').upsert(registros);
-    console.log(`💾 [${userId}] ${registros.length} grupo(s) salvo(s) (busca completa).`);
-  } catch (e) {
-    console.error(`⚠️ [${userId}] Erro ao sincronizar grupos:`, e.message);
-  }
-}
-
 // ─── INICIAR CONEXÃO DE UM USUÁRIO ──────────────────────────────────────────
 async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
   if (sockets.has(userId)) return; // já conectado ou conectando
@@ -417,61 +354,14 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     version: waVersion, // undefined aqui faz o Baileys cair de volta na versão padrão do pacote
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: Browsers.macOS('Chrome'),
-    // ── Redução de CPU/memória no boot/reconexão ────────────────────────────
-    // O plano Free do Render só dá 0.15 vCPU pro processo inteiro (confirmado
-    // nas métricas: cada reconexão empurra o uso de CPU até o teto, o que
-    // deixa o event loop sem responder a tempo do health check, o Render mata
-    // o processo, ele sobe de novo, refaz a reconexão pesada e empurra o CPU
-    // pro teto outra vez — um loop de reinício a cada ~90s). Por padrão o
-    // Baileys sincroniza o histórico completo de mensagens e marca o usuário
-    // como "online" a cada conexão, e nada disso é usado pelo VendaBot (que só
-    // dispara mensagens, não lê histórico) — desligar isso tira uma fatia
-    // pesada de trabalho logo no momento mais crítico (reconexão).
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    generateHighQualityLinkPreview: false,
-    // ── Detecção mais rápida de conexão travada/morta ───────────────────────
-    // Com os valores padrão do Baileys, uma conexão que trava no meio do
-    // handshake (TCP abriu mas o WhatsApp não responde) só é percebida depois
-    // de bem mais tempo — na prática, parece "travado" pro usuário, que fica
-    // olhando o QR/código sem acontecer nada. Deixando esses tempos mais
-    // agressivos, o Baileys desiste mais rápido de uma tentativa ruim e cai na
-    // lógica de reconexão automática que já existe mais abaixo, em vez de
-    // ficar preso silenciosamente.
-    connectTimeoutMs: 20000,      // desiste do handshake inicial em 20s (não fica esperando indefinidamente)
-    keepAliveIntervalMs: 15000,   // percebe queda de conexão silenciosa mais cedo (padrão é mais espaçado)
-    defaultQueryTimeoutMs: 30000, // qualquer operação (buscar grupos, enviar mensagem) desiste em 30s em vez de travar
-    emitOwnEvents: false          // não processa eco das próprias mensagens enviadas — menos trabalho por evento
+    browser: Browsers.macOS('Chrome')
   });
   sockets.set(userId, sock);
-
-  // ── Watchdog anti-travamento ─────────────────────────────────────────────
-  // Se o socket for criado e o WhatsApp simplesmente não responder NADA (nem
-  // QR, nem erro, nem fechamento) — um travamento silencioso no meio do
-  // handshake — hoje isso deixava o usuário preso na tela de "conectando"
-  // sem nenhuma saída automática, só resolvia clicando em "Gerar novo código"
-  // na mão. Esse timer força uma nova tentativa sozinho se não vier absolutamente
-  // nenhum evento de connection.update dentro do prazo. É cancelado assim que
-  // QUALQUER evento chegar (linha logo no início do handler abaixo) — só dispara
-  // mesmo quando não rolou comunicação nenhuma.
-  const watchdogTravamento = setTimeout(() => {
-    if (socketGeracao.get(userId) !== minhaGeracao) return; // já foi superado por outra tentativa, nada a fazer
-    console.warn(`⏱️ [${userId}] Nenhuma resposta do WhatsApp em 25s (socket travado). Forçando nova tentativa...`);
-    socketGeracao.set(userId, minhaGeracao + 1);
-    try { sock.end(new Error('Watchdog: sem resposta, forçando reconexão')); } catch (e) {}
-    sockets.delete(userId);
-    iniciarConexaoUsuario(userId, metodo, telefone);
-  }, 25000);
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
     // Socket superado por uma nova tentativa de conexão (ex: usuário pediu novo código
     // de pareamento enquanto este ainda estava terminando de se desligar) — ignora.
     if (socketGeracao.get(userId) !== minhaGeracao) return;
-
-    // Chegou QUALQUER evento — o socket está vivo e se comunicando de verdade,
-    // então o watchdog de travamento acima não precisa (e não deve) disparar.
-    clearTimeout(watchdogTravamento);
 
     // O evento 'qr' é o sinal de que a conexão terminou o handshake inicial e está
     // pronta pra autenticação — tanto pro fluxo de QR quanto pro de pairing. Pedir o
@@ -525,7 +415,14 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
         notificarReconexao(userId); // dispara em segundo plano, não trava o fluxo de conexão
       }
       setTimeout(async () => {
-        await sincronizarGruposSeNecessario(userId, sock);
+        try {
+          const grupos = await sock.groupFetchAllParticipating();
+          const registros = Object.entries(grupos).map(([id, g]) => ({
+            user_id: userId, gid: id, name: g.subject, updated_at: new Date().toISOString()
+          }));
+          if (registros.length) await supabase.from('whatsapp_groups_available').upsert(registros);
+          console.log(`💾 [${userId}] ${registros.length} grupo(s) salvo(s).`);
+        } catch (e) {}
         await agendarMensagensUsuario(userId);
       }, 3000);
     }
@@ -533,23 +430,7 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
     if (connection === 'close') {
       sockets.delete(userId);
       cancelarJobsUsuario(userId);
-      const codigoDesconexao = lastDisconnect?.error?.output?.statusCode;
-      const deslogado = codigoDesconexao === DisconnectReason.loggedOut;
-
-      // O WhatsApp costuma exigir um reinício único da conexão logo depois do
-      // primeiro pareamento/QR aceito — às vezes ANTES até do evento 'open'
-      // chegar a disparar, às vezes logo depois. É parte normal do protocolo,
-      // não é queda de verdade. Se deixarmos cair na lógica de baixo, o
-      // bot_status é marcado como "disconnected" à toa por alguns segundos, e
-      // o app pisca de volta pra tela de escolher QR/pareamento (ou nem chega
-      // a mostrar "conectado") mesmo a sessão indo ficar boa logo em seguida.
-      // Por isso tratamos esse código isoladamente: reconecta na hora, sem
-      // tocar em bot_status, sem mexer nos contadores de falha de pareamento.
-      if (codigoDesconexao === DisconnectReason.restartRequired) {
-        console.log(`🔁 [${userId}] Reinício esperado após pareamento/QR, reconectando sem alterar o status...`);
-        setTimeout(() => iniciarConexaoUsuario(userId, metodo, telefone), 1500);
-        return;
-      }
+      const deslogado = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
 
       // No pareamento, o WhatsApp às vezes derruba a conexão com o MESMO código de
       // "logout" (401) só alguns segundos depois de emitir o código — antes de dar
@@ -558,19 +439,10 @@ async function iniciarConexaoUsuario(userId, metodo = 'qr', telefone = null) {
       // -> cai sozinho -> gera outro código -> cai de novo". Por isso só tratamos como
       // logout definitivo se: não é pareamento, OU já demorou tempo suficiente pra ser
       // uma rejeição de verdade, OU já tentamos de novo automaticamente demais.
-      // Cair ANTES de sequer gerar um código de pareamento é mais claramente
-      // ainda "não foi o usuário" do que cair rápido demais depois do código —
-      // a pessoa nem teve chance de digitar nada ainda. Antes, esse caso caía
-      // no "senão" (rejeição definitiva) por engano, porque sem nenhum código
-      // emitido nessa rodada o cálculo de "tempo desde o código" comparava com
-      // a época Unix (1970) e nunca dava "cedo demais". Isso obrigava a pessoa
-      // a clicar em "Gerar novo código" na mão pra conseguir uma segunda
-      // tentativa, quando o bot já podia ter tentado de novo sozinho.
-      const semCodigoAindaEmitidoNessaRodada = metodo === 'pairing' && !pairingCodigoGeradoEm.has(userId);
       const geradoEm = pairingCodigoGeradoEm.get(userId) || 0;
-      const caiuRapidoDemaisAposCodigo = metodo === 'pairing' && geradoEm > 0 && (Date.now() - geradoEm) < PAIRING_FALHA_RAPIDA_MS;
+      const caiuRapidoDemaisAposCodigo = metodo === 'pairing' && (Date.now() - geradoEm) < PAIRING_FALHA_RAPIDA_MS;
       const tentativasRapidas = pairingFalhasRapidas.get(userId) || 0;
-      const tentarDeNovoSemApagar = deslogado && (semCodigoAindaEmitidoNessaRodada || caiuRapidoDemaisAposCodigo) && tentativasRapidas < PAIRING_MAX_TENTATIVAS_AUTOMATICAS;
+      const tentarDeNovoSemApagar = deslogado && caiuRapidoDemaisAposCodigo && tentativasRapidas < PAIRING_MAX_TENTATIVAS_AUTOMATICAS;
       const deslogadoDeVerdade = deslogado && !tentarDeNovoSemApagar;
 
       // Se ainda estamos dentro da janela de um pairing code pendente (e não é um
@@ -623,7 +495,6 @@ function monitorarSupabase() {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_status' }, async (payload) => {
       const row = payload.new;
       if (!row) return;
-      if (!pertenceAEsseServico(row.connection_method)) return; // esse usuário é do outro serviço (QR ou Número) — ignora por completo
       if (row.status === 'requested') {
         const socketPreso = sockets.get(row.user_id);
         if (socketPreso) {
@@ -635,7 +506,6 @@ function monitorarSupabase() {
         }
         pairingPendente.delete(row.user_id); // pedido explícito de nova tentativa: libera gerar código novo
         pairingFalhasRapidas.delete(row.user_id); // conta as tentativas automáticas do zero de novo
-        pairingCodigoGeradoEm.delete(row.user_id); // essa é uma sessão nova: nenhum código foi emitido ainda nela
 
         if (aindaAquecendo()) {
           const faltam = AQUECIMENTO_MS - (Date.now() - SERVER_START);
@@ -666,14 +536,14 @@ function monitorarSupabase() {
         await supabase.from('bot_auth_state').delete().eq('user_id', row.user_id);
       }
     })
-    .subscribe((status) => tratarStatusCanal('bot_status', status));
+    .subscribe((status) => console.log(`📡 [bot_status] Realtime: ${status}`));
 
   supabase
     .channel('vendabot-config-changes')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, (p) => recarregarUsuario(p))
     .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, (p) => recarregarUsuario(p))
     .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, (p) => recarregarUsuario(p))
-    .subscribe((status) => tratarStatusCanal('config', status));
+    .subscribe((status) => console.log(`📡 [config] Realtime: ${status}`));
 
   function recarregarUsuario(payload) {
     const userId = (payload.new && payload.new.user_id) || (payload.old && payload.old.user_id);
@@ -693,65 +563,16 @@ async function reconectarUsuariosExistentes() {
 
   if (error) { console.error('❌ Erro ao buscar usuários existentes:', error.message); return; }
 
-  const meusUsuarios = (data || []).filter((row) => pertenceAEsseServico(row.connection_method));
-
-  for (const row of meusUsuarios) {
+  for (const row of data || []) {
     await iniciarConexaoUsuario(row.user_id, row.connection_method || 'qr', row.phone_number || null);
-    // Espaça as reconexões no boot — cada handshake do Baileys usa bastante
-    // CPU (criptografia do Signal Protocol), e o plano Free do Render só dá
-    // 0.15 vCPU pro processo inteiro. Reconectar todo mundo ao mesmo tempo
-    // sufoca esse processador fraco, o que pode inclusive disparar o
-    // watchdog de auto-cura logo abaixo (achando que o processo travou) e
-    // gerar um loop de reinício repetido — visto na prática em 13/09/2026.
-    await new Promise(r => setTimeout(r, 3000));
   }
-  console.log(`🔁 ${meusUsuarios.length} usuário(s) recarregado(s) ao iniciar (modo ${MODO_CONEXAO.toUpperCase()}).`);
+  console.log(`🔁 ${data?.length || 0} usuário(s) recarregado(s) ao iniciar.`);
 }
-
-// ─── AUTO-CURA: reinicia sozinho quando o processo trava de verdade ────────
-// O Render só reinicia automaticamente quando o processo CRASHA — não quando
-// ele fica "vivo" mas mudo (ex: o Realtime do Supabase caiu e parou de reagir
-// a pedidos de conexão, só que o servidor HTTP continua respondendo 200 numa
-// rota que nem checa isso). Foi exatamente isso que aconteceu no incidente de
-// hoje: precisou de um humano notar e clicar em "Manual Deploy". As duas
-// checagens abaixo transformam esse tipo de trava silenciosa num crash de
-// verdade — e cada crash o Render sobe uma instância nova sozinho, em
-// segundos, sem precisar de ninguém notando ou clicando em nada.
-
-function tratarStatusCanal(nomeCanal, status) {
-  console.log(`📡 [${nomeCanal}] Realtime: ${status}`);
-  if (status === 'TIMED_OUT' || status === 'CHANNEL_ERROR' || status === 'CLOSED') {
-    console.error(`🔴 [${nomeCanal}] Canal Realtime caiu de vez (${status}). Reiniciando o processo pra o Render subir uma instância limpa...`);
-    setTimeout(() => process.exit(1), 1000); // pequeno atraso só pra garantir que o log acima saia antes do processo morrer
-  }
-}
-
-// Rede de segurança extra: mesmo que o canal Realtime não emita nenhum status
-// de erro explícito (pode simplesmente ficar "SUBSCRIBED" só de nome, mas sem
-// realmente entregar eventos), uma consulta simples ao banco falhando
-// repetidas vezes também é sinal de processo preso/sem rede. Depois de
-// algumas falhas seguidas, mesma solução: mata o processo, Render sobe outro.
-let falhasConsecutivasDeSaude = 0;
-const MAX_FALHAS_DE_SAUDE = 5; // era 3 — sob CPU sufocado (throttling do Free) uma consulta pode atrasar sem o banco estar realmente fora do ar
-setInterval(async () => {
-  try {
-    const { error } = await supabase.from('bot_status').select('user_id').limit(1);
-    if (error) throw error;
-    falhasConsecutivasDeSaude = 0;
-  } catch (e) {
-    falhasConsecutivasDeSaude++;
-    console.error(`⚠️ Checagem de saúde falhou (${falhasConsecutivasDeSaude}/${MAX_FALHAS_DE_SAUDE}):`, e.message);
-    if (falhasConsecutivasDeSaude >= MAX_FALHAS_DE_SAUDE) {
-      console.error('🔴 Banco inacessível repetidamente. Reiniciando o processo...');
-      process.exit(1);
-    }
-  }
-}, 60000); // a cada 1 minuto
 
 process.on('uncaughtException', e => console.error('🔴 ERRO:', e.message));
 process.on('unhandledRejection', e => console.error('🔴 ERRO PROMISE:', e.message || e));
 
-console.log(`🤖 VendaBot multi-tenant iniciando... (modo: ${MODO_CONEXAO.toUpperCase()})\n`);
+console.log('🤖 VendaBot multi-tenant iniciando...\n');
 monitorarSupabase();
 setTimeout(() => {
   console.log('🔥 Aquecimento concluído, reconectando usuários existentes...');
