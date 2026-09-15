@@ -1,16 +1,43 @@
 // ╔══════════════════════════════════════════════════════════════╗
-// ║   AGENTE IA KAUÃ v4 — Inteligente, sem repetição             ║
-// ║   (corrigido: match de categoria ignora acento + diversifica ║
-// ║    produto entre grupos diferentes no mesmo disparo)         ║
+// ║   AGENTE IA KAUÃ v5 — Round-robin real + histórico persistente║
+// ║                                                                ║
+// ║   Mudanças desta versão (zero mudança no bot.js, mesma         ║
+// ║   assinatura de gerarParaGrupo/gerarParaHorario):               ║
+// ║                                                                ║
+// ║   1) PERSISTÊNCIA: o histórico de produto/copy por grupo agora ║
+// ║      é salvo na tabela `agente_historico` do Supabase (mesmo   ║
+// ║      projeto que já guarda bot_auth_state), em vez de só na    ║
+// ║      memória do processo. Como o Render free reinicia/derruba  ║
+// ║      a instância com frequência, um arquivo local no disco     ║
+// ║      seria perdido do mesmo jeito — Supabase sobrevive a isso. ║
+// ║      O histórico é carregado uma vez na subida do módulo (top- ║
+// ║      level await, então já está pronto antes do bot.js seguir  ║
+// ║      em frente) e cada uso é salvo em background (fire-and-    ║
+// ║      forget) sem travar o envio de mensagem.                   ║
+// ║                                                                ║
+// ║   2) ROUND-ROBIN DE VERDADE: antes, só evitava repetir os      ║
+// ║      últimos 3 produtos/copys. Agora cada grupo passa por      ║
+// ║      TODOS os produtos válidos daquele contexto (e por TODAS   ║
+// ║      as copys) antes de qualquer um poder repetir — só reseta  ║
+// ║      quando o "baralho" daquele subconjunto acaba.             ║
+// ║                                                                ║
+// ║   3) MAIS VARIEDADE DE COPY: de 16 para 28 modelos (20 geral + ║
+// ║      8 motoboy), com estilos diferentes — urgência, pergunta,  ║
+// ║      benefício direto, storytelling curto — não só emoji       ║
+// ║      trocado.                                                  ║
 // ╚══════════════════════════════════════════════════════════════╝
 
+import { createClient } from '@supabase/supabase-js';
+
+// ─── SUPABASE (mesmas variáveis de ambiente que o bot.js já usa) ───────────
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+} else {
+  console.warn('⚠️  Agente: SUPABASE_URL/SUPABASE_SERVICE_KEY não encontrados — histórico do agente vai funcionar só em memória (não sobrevive a reinício).');
+}
+
 // ─── NORMALIZAÇÃO DE TEXTO (ignora acento/maiúsculas na comparação) ─────────
-// Antes, comparávamos texto acentuado ("Relógio", "Sandália") contra
-// palavras-chave sem acento ("relogio", "sandalia") e a maioria não batia —
-// isso fazia sobrar só 1 produto "por sorte" em várias faixas de horário, e
-// esse único produto acabava sendo mandado pra TODOS os grupos naquele
-// disparo. Normalizando os dois lados (removendo acento e caixa) antes de
-// comparar, o match fica correto de verdade.
 function normalizar(str) {
   return String(str || '')
     .normalize('NFD')
@@ -25,7 +52,7 @@ function getSaudacao(hora) {
   return 'BOA NOITE';
 }
 
-// ─── COPYS GERAIS (10 modelos) ───────────────────────────────────────────────
+// ─── COPYS GERAIS (20 modelos, estilos variados) ────────────────────────────
 const COPYS_GERAIS = [
   `🌞 *{SAUDACAO}! TEM OFERTA BOA HOJE!* 🌞\n🔥 *{NOME}* 🔥\n💰 De: ~~R$ {PRECO_ANTIGO}~~\n✅ Por apenas: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⏳ Aproveite enquanto a promoção estiver disponível.\n👉 Confira aqui:\n{LINK}`,
   `🚨 *ACHADO DO DIA!* 🚨\n👀 Encontrei essa promoção e vim compartilhar!\n📦 *{NOME}*\n❌ De: ~~R$ {PRECO_ANTIGO}~~\n💥 Hoje por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 Veja antes que o estoque acabe!\n{LINK}`,
@@ -36,17 +63,29 @@ const COPYS_GERAIS = [
   `📢 *PROMOÇÃO RELÂMPAGO!*\n🔥 *{NOME}*\n💲 De: ~~R$ {PRECO_ANTIGO}~~\n💚 Agora: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚠️ Aproveite enquanto o desconto estiver ativo.\n👉 {LINK}`,
   `🎯 *OFERTA QUE VALE A PENA!*\n📦 *{NOME}*\n💸 ~~R$ {PRECO_ANTIGO}~~ ➜ *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n✨ Excelente oportunidade.\n👉 {LINK}`,
   `🔥 *CORRE QUE BAIXOU!*\n📦 *{NOME}*\n💰 De ~~R$ {PRECO_ANTIGO}~~\n✅ Por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👀 Confere aí!\n👉 {LINK}`,
-  `🌟 *OFERTA DO MOMENTO* 🌟\n📦 *{NOME}*\n💵 De: ~~R$ {PRECO_ANTIGO}~~\n🔥 Agora por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🚀 Aproveite a promoção.\n👉 {LINK}`
+  `🌟 *OFERTA DO MOMENTO* 🌟\n📦 *{NOME}*\n💵 De: ~~R$ {PRECO_ANTIGO}~~\n🔥 Agora por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🚀 Aproveite a promoção.\n👉 {LINK}`,
+  `🤔 *Já tá precisando disso?*\n📦 *{NOME}*\n💰 Preço lá em cima: ~~R$ {PRECO_ANTIGO}~~\n✅ Aqui: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 Dá uma olhada:\n{LINK}`,
+  `✅ *RESOLVE NA HORA!*\n📦 *{NOME}*\n💰 Sai por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n❌ Preço normal: ~~R$ {PRECO_ANTIGO}~~\n🙌 Prático, útil e no precinho.\n👉 {LINK}`,
+  `📝 *Relato rápido:* achei esse aqui navegando e vim avisar.\n📦 *{NOME}*\n💰 De ~~R$ {PRECO_ANTIGO}~~ por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 Vale conferir:\n{LINK}`,
+  `⏰ *ÚLTIMAS HORAS DE PREÇO ASSIM!*\n🔥 *{NOME}*\n❌ ~~R$ {PRECO_ANTIGO}~~\n✅ *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🏃 Corre que não demora a voltar ao normal.\n👉 {LINK}`,
+  `👀 *Quem aqui tava esperando baixar?*\n📦 *{NOME}*\n💸 ~~R$ {PRECO_ANTIGO}~~ ➜ *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 Agora é a hora:\n{LINK}`,
+  `🙋 *PRA FACILITAR O DIA A DIA*\n📦 *{NOME}*\n💰 De: ~~R$ {PRECO_ANTIGO}~~\n✅ Por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n✨ Simples e direto ao ponto.\n👉 {LINK}`,
+  `🗣️ *Chegou pedido de indicação — segue!*\n📦 *{NOME}*\n💰 ~~R$ {PRECO_ANTIGO}~~ por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 Olha só:\n{LINK}`,
+  `*{NOME}*\nDe R$ {PRECO_ANTIGO} por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\nLink pra garantir o preço:\n{LINK}`,
+  `👥 *A galera tá comprando esse aqui!*\n📦 *{NOME}*\n💰 De ~~R$ {PRECO_ANTIGO}~~\n✅ Por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 {LINK}`,
+  `💭 *Cansado de pagar caro nisso?*\n📦 *{NOME}*\n❌ ~~R$ {PRECO_ANTIGO}~~\n✅ *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 {LINK}`
 ];
 
-// ─── COPYS MOTOBOY (6 modelos) ───────────────────────────────────────────────
+// ─── COPYS MOTOBOY (8 modelos, estilos variados) ────────────────────────────
 const COPYS_MOTOBOY = [
   `🏍️ *ACHADO PARA MOTOCA!* 🏍️\n🔥 *{NOME}*\n💰 De: ~~R$ {PRECO_ANTIGO}~~\n✅ Por apenas: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Produto aprovado pelos irmãos do asfalto!\n👉 Confira:\n{LINK}`,
   `🛵 *PROMOÇÃO PRA QUEM TÁ NA RODA!* 🛵\n📦 *{NOME}*\n❌ ~~R$ {PRECO_ANTIGO}~~\n💥 Agora por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🏍️ Essencial pra quem vive de moto!\n👉 {LINK}`,
   `🚨 *ATENÇÃO MOTOBOYS!* 🚨\n📢 Oferta imperdível chegou!\n🏍️ *{NOME}*\n💸 De: ~~R$ {PRECO_ANTIGO}~~\n💚 Por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⏳ Corre que é por tempo limitado!\n👉 {LINK}`,
   `⚡ *OFERTA RELÂMPAGO PARA MOTOCA!* ⚡\n🛵 *{NOME}*\n💰 De ~~R$ {PRECO_ANTIGO}~~\n🔥 Por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🏍️ Perfeito pra quem roda todo dia!\n👉 {LINK}`,
   `🔥 *OLHA ESSE ACHADO, MOTOCA!*\n📦 *{NOME}*\n💵 ~~R$ {PRECO_ANTIGO}~~ ➜ *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n🛵 Quem é da vida não pode perder!\n⏳ Aproveite enquanto tem!\n👉 {LINK}`,
-  `🪖 *EQUIPAMENTO BOM E BARATO!* 🪖\n🏍️ *{NOME}*\n❌ De: ~~R$ {PRECO_ANTIGO}~~\n✅ Hoje por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Segurança e economia andam juntas!\n👉 {LINK}`
+  `🪖 *EQUIPAMENTO BOM E BARATO!* 🪖\n🏍️ *{NOME}*\n❌ De: ~~R$ {PRECO_ANTIGO}~~\n✅ Hoje por: *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n⚡ Segurança e economia andam juntas!\n👉 {LINK}`,
+  `❓ *Motoboy, já tá com esse aí?*\n🏍️ *{NOME}*\n💰 De ~~R$ {PRECO_ANTIGO}~~\n✅ Por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 {LINK}`,
+  `🗣️ *Motoboy aqui do grupo pediu indicação — segue!*\n🏍️ *{NOME}*\n💸 ~~R$ {PRECO_ANTIGO}~~ por *R$ {PRECO_ATUAL}*{DESCONTO_TAG}\n👉 {LINK}`
 ];
 
 // ─── CATEGORIAS POR HORÁRIO (comparadas já sem acento, ver normalizar()) ────
@@ -65,20 +104,73 @@ const DIAS_SEMANA = {
 
 const SEMPRE_CONVERTE = ['air fryer','robo aspirador','smartwatch','fone bluetooth','carregador','power bank','tenis','perfume','bolsa','mochila','kit ferramentas','caixa de som','impressora','projetor'];
 
-// ─── HISTÓRICO POR GRUPO (evita repetição) ──────────────────────────────────
-const historicoPorGrupo = {}; // { grupoId: { produtos: [], copys: [] } }
+// ─── HISTÓRICO POR GRUPO (round-robin real, persistido no Supabase) ────────
+// produtosRodada / copysRodada.{geral,motoboy}: Sets com os ids/índices já
+// usados NESTA rodada do grupo. Um item só pode repetir depois que TODO o
+// conjunto atual (baralho) foi usado — aí a rodada reseta sozinha.
+const historicoPorGrupo = {};
 
 function getHistorico(grupoId) {
-  if (!historicoPorGrupo[grupoId]) historicoPorGrupo[grupoId] = { produtos: [], copys: [] };
+  if (!historicoPorGrupo[grupoId]) {
+    historicoPorGrupo[grupoId] = {
+      produtosRodada: new Set(),
+      copysRodada: { geral: new Set(), motoboy: new Set() },
+      ultimoProduto: null,
+      ultimaCopy: { geral: null, motoboy: null }
+    };
+  }
   return historicoPorGrupo[grupoId];
 }
 
-function registrarUso(grupoId, produtoId, copyIdx) {
+function hidratarGrupo(grupoId, row) {
   const h = getHistorico(grupoId);
-  h.produtos.push(produtoId);
-  h.copys.push(copyIdx);
-  if (h.produtos.length > 10) h.produtos = h.produtos.slice(-10);
-  if (h.copys.length > 10) h.copys = h.copys.slice(-10);
+  h.produtosRodada = new Set(row.produtos_rodada || []);
+  h.copysRodada.geral = new Set(row.copys_rodada_geral || []);
+  h.copysRodada.motoboy = new Set(row.copys_rodada_motoboy || []);
+  h.ultimoProduto = row.ultimo_produto ?? null;
+  h.ultimaCopy.geral = row.ultima_copy_geral ?? null;
+  h.ultimaCopy.motoboy = row.ultima_copy_motoboy ?? null;
+}
+
+async function carregarHistoricoInicial() {
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase.from('agente_historico').select('*');
+    if (error) throw error;
+    (data || []).forEach(row => hidratarGrupo(row.grupo_id, row));
+    console.log(`🧠 Agente: histórico carregado do Supabase (${(data || []).length} grupo(s)).`);
+  } catch (e) {
+    console.error('⚠️  Agente: falha ao carregar histórico do Supabase, começando do zero:', e.message);
+  }
+}
+
+// Top-level await: como bot.js faz `import * as agente from './agente.js'`,
+// essa linha garante que o histórico já está carregado ANTES do bot.js
+// continuar a execução — sem precisar chamar nada a mais lá.
+await carregarHistoricoInicial();
+
+function persistirHistorico(grupoId) {
+  if (!supabase) return;
+  const h = getHistorico(grupoId);
+  supabase.from('agente_historico').upsert({
+    grupo_id: String(grupoId),
+    produtos_rodada: Array.from(h.produtosRodada),
+    copys_rodada_geral: Array.from(h.copysRodada.geral),
+    copys_rodada_motoboy: Array.from(h.copysRodada.motoboy),
+    ultimo_produto: h.ultimoProduto,
+    ultima_copy_geral: h.ultimaCopy.geral,
+    ultima_copy_motoboy: h.ultimaCopy.motoboy,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'grupo_id' }).then(({ error }) => {
+    if (error) console.error(`⚠️  Agente: falha ao salvar histórico do grupo ${grupoId}:`, error.message);
+  }).catch(e => console.error(`⚠️  Agente: erro ao salvar histórico do grupo ${grupoId}:`, e.message));
+}
+
+function registrarUso(grupoId, produtoId) {
+  const h = getHistorico(grupoId);
+  h.produtosRodada.add(produtoId);
+  h.ultimoProduto = produtoId;
+  persistirHistorico(grupoId); // fire-and-forget, não trava o envio
 }
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
@@ -102,9 +194,7 @@ function isGrupoMotoboy(nomeGrupo) {
 }
 
 function getCategoriasPorContexto(hora, diaSemana) {
-  // Dia especial tem prioridade
   if (DIAS_SEMANA[diaSemana]) return DIAS_SEMANA[diaSemana];
-  // Por horário
   for (const [, v] of Object.entries(HORARIOS)) {
     if (hora >= v.min && hora < v.max) return v.cats;
   }
@@ -113,34 +203,35 @@ function getCategoriasPorContexto(hora, diaSemana) {
 
 function produtoMatchCategoria(produto, categorias, categoriaForcada) {
   const texto = normalizar((produto.category || '') + ' ' + (produto.name || ''));
-  // Se tem categoria forçada no agendamento, usa ela
   if (categoriaForcada) return texto.includes(normalizar(categoriaForcada));
-  // Senão usa categorias do horário
   return categorias.some(c => texto.includes(normalizar(c)));
 }
 
 // Dado um array de produtos já filtrados por uma regra (motoboy, categoria,
-// etc), tenta primeiro achar um que NÃO tenha sido usado nem no histórico
-// recente do grupo (últimos 3) nem já usado NESSE MESMO disparo (outros
-// grupos que já receberam mensagem agora há pouco, no mesmo ciclo do
-// agendamento). Se não sobrar nenhum com essa restrição dupla, relaxa pro
-// histórico do grupo (mantém só a regra de não repetir dentro do mesmo
-// disparo). Se ainda assim não sobrar nada (ex: só existe 1 produto válido no
-// total), aí sim permite repetir — não tem outra opção.
+// etc), primeiro tira quem já foi usado NESTE MESMO disparo (outros grupos
+// que já receberam mensagem agora há pouco, no mesmo ciclo do agendamento —
+// essa regra nunca é relaxada). Dentro do que sobrar, tira quem já está na
+// rodada atual do grupo (round-robin). Se isso esvaziar tudo, quer dizer que
+// esse subconjunto específico já deu uma volta completa: libera de novo só
+// os itens desse subconjunto (reseta a rodada apenas pra eles) e retorna o
+// subconjunto inteiro.
 function semRepetir(lista, hist, usadosNesteCiclo) {
   if (!lista.length) return lista;
-  const semNadaRepetido = lista.filter(p => !usadosNesteCiclo.has(p.id) && !hist.produtos.slice(-3).includes(p.id));
-  if (semNadaRepetido.length) return semNadaRepetido;
-  const soSemRepetirNesteCiclo = lista.filter(p => !usadosNesteCiclo.has(p.id));
-  if (soSemRepetirNesteCiclo.length) return soSemRepetirNesteCiclo;
-  return lista; // não tem jeito, só sobrou repetir
+  const foraDoDisparo = lista.filter(p => !usadosNesteCiclo.has(p.id));
+  const candidatos = foraDoDisparo.length ? foraDoDisparo : lista;
+
+  const semRodada = candidatos.filter(p => !hist.produtosRodada.has(p.id));
+  if (semRodada.length) return semRodada;
+
+  // Baralho desse subconjunto acabou — libera de novo, mas sem deixar repetir
+  // o mesmo item que acabou de ser usado (senão dá repetição seguida bem na
+  // hora do reset, ex: ...p3, p3...).
+  candidatos.forEach(p => hist.produtosRodada.delete(p.id));
+  const semORecente = candidatos.filter(p => p.id !== hist.ultimoProduto);
+  return semORecente.length ? semORecente : candidatos;
 }
 
 // ─── ESCOLHER PRODUTO INTELIGENTE ────────────────────────────────────────────
-// usadosNesteCiclo: Set com os IDs de produto já escolhidos nesse MESMO disparo
-// (mesmo horário, passando por vários grupos em sequência) — evita que todos
-// os grupos recebam o mesmo produto só porque, individualmente, cada grupo
-// "achava" que aquele produto tava livre no histórico dele.
 function escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categoriaForcada, usadosNesteCiclo) {
   const ciclo = usadosNesteCiclo || new Set();
   const validos = produtos.filter(p => p.oldPrice && p.price && p.link);
@@ -150,40 +241,39 @@ function escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categori
   const ehMotoboy = isGrupoMotoboy(nomeGrupo);
   const categorias = getCategoriasPorContexto(hora, diaSemana);
 
-  // 1. Grupo motoboy → só produto motoboy
   if (ehMotoboy) {
     const motoboys = semRepetir(validos.filter(p => isMotoboy(p)), hist, ciclo);
     if (motoboys.length) return { produto: motoboys[Math.floor(Math.random() * motoboys.length)], tipo: 'motoboy' };
-    // Se não tem produto motoboy, avisa (mas ainda assim tenta não repetir)
     const qualquer = semRepetir(validos, hist, ciclo);
     if (qualquer.length) return { produto: qualquer[Math.floor(Math.random() * qualquer.length)], tipo: 'motoboy' };
   }
 
-  // 2. Categoria forçada pelo agendamento
   if (categoriaForcada) {
     const porCategoria = semRepetir(validos.filter(p => produtoMatchCategoria(p, [], categoriaForcada)), hist, ciclo);
     if (porCategoria.length) return { produto: porCategoria[Math.floor(Math.random() * porCategoria.length)], tipo: 'geral' };
   }
 
-  // 3. Categoria certa pro horário/dia
   const porHorario = semRepetir(validos.filter(p => produtoMatchCategoria(p, categorias, null)), hist, ciclo);
   if (porHorario.length) return { produto: porHorario[Math.floor(Math.random() * porHorario.length)], tipo: 'geral' };
 
-  // 4. Qualquer produto não repetido
   const disponiveis = semRepetir(validos, hist, ciclo);
   return { produto: disponiveis[Math.floor(Math.random() * disponiveis.length)], tipo: 'geral' };
 }
 
-// ─── ESCOLHER COPY SEM REPETIR ────────────────────────────────────────────────
-function escolherCopy(copys, grupoId) {
+// ─── ESCOLHER COPY SEM REPETIR (round-robin por tipo geral/motoboy) ────────
+function escolherCopy(copys, grupoId, tipo) {
   const hist = getHistorico(grupoId);
-  const ultimasCopys = hist.copys.slice(-3);
-  let idx;
-  let tentativas = 0;
-  do {
-    idx = Math.floor(Math.random() * copys.length);
-    tentativas++;
-  } while (ultimasCopys.includes(idx) && tentativas < 20);
+  const rodada = hist.copysRodada[tipo];
+  let disponiveis = copys.map((_, i) => i).filter(i => !rodada.has(i));
+  if (!disponiveis.length) {
+    rodada.clear(); // baralho de copys acabou, libera de novo
+    const ultima = hist.ultimaCopy[tipo];
+    const semARecente = copys.map((_, i) => i).filter(i => i !== ultima);
+    disponiveis = semARecente.length ? semARecente : copys.map((_, i) => i);
+  }
+  const idx = disponiveis[Math.floor(Math.random() * disponiveis.length)];
+  rodada.add(idx);
+  hist.ultimaCopy[tipo] = idx;
   return idx;
 }
 
@@ -195,9 +285,10 @@ function gerarMensagem(produto, tipo, grupoId, hora) {
   const descontoTag = desconto > 0 ? ` (${desconto}% OFF)` : '';
 
   const copys = tipo === 'motoboy' ? COPYS_MOTOBOY : COPYS_GERAIS;
-  const idx = escolherCopy(copys, grupoId);
+  const tipoCopy = tipo === 'motoboy' ? 'motoboy' : 'geral';
+  const idx = escolherCopy(copys, grupoId, tipoCopy);
 
-  registrarUso(grupoId, produto.id, idx);
+  registrarUso(grupoId, produto.id); // marca produto e persiste (produto + copy juntos, já marcados acima)
 
   const mensagem = copys[idx]
     .replace(/{SAUDACAO}/g, getSaudacao(hora))
@@ -211,9 +302,6 @@ function gerarMensagem(produto, tipo, grupoId, hora) {
 }
 
 // ─── FUNÇÃO PRINCIPAL ───────────────────────────────────────────────────────
-// usadosNesteCiclo (opcional): Set compartilhado entre as chamadas dessa
-// função dentro do MESMO disparo (o bot.js cria um Set novo a cada horário
-// agendado e reaproveita ele pra cada grupo daquela rodada).
 function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada, usadosNesteCiclo) {
   const agora = new Date();
   const diaSemana = agora.getDay();
