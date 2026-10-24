@@ -254,7 +254,8 @@ async function lerConfigUsuario(userId) {
 
   const products = (productsRaw || []).map(p => ({
     id: p.id, name: p.name, oldPrice: p.old_price, price: p.price,
-    link: p.link, imageUrl: p.image_url, category: p.category
+    link: p.link, imageUrl: p.image_url, category: p.category,
+    platform: p.platform
   }));
   const groups = (groupsRaw || []).map(g => ({
     id: g.id, name: g.name, gid: g.whatsapp_gid, role: g.role
@@ -324,6 +325,22 @@ async function enviarMensagem(sock, jid, texto, imageUrl, tentativas = 3) {
     }
   }
   return { ok: false, error: ultimoErro?.message || 'Erro desconhecido', semPermissao: ehErroDePermissao(ultimoErro || {}) };
+} 
+// ─── EVENTOS DOS AGENTES (alimentam a tela inicial do app) ──────────────────
+// A pausa entre as etapas é só pra o painel conseguir mostrar cada agente
+// trabalhando. Se quiser tirar, coloque PAUSA_EVENTO_MS = 0.
+const PAUSA_EVENTO_MS = 1200;
+const pausa = (ms = PAUSA_EVENTO_MS) => new Promise(r => setTimeout(r, ms));
+
+async function emitirEvento(userId, agent, action, extra = {}) {
+  try {
+    const { error } = await supabase
+      .from('agent_events')
+      .insert({ user_id: userId, agent, action, channel: 'whatsapp', ...extra });
+    if (error) console.error(`⚠️ [${userId}] Falha ao gravar evento do agente:`, error.message);
+  } catch (e) {
+    console.error(`⚠️ [${userId}] Erro ao gravar evento do agente:`, e.message);
+  }
 }
 
 function cancelarJobsUsuario(userId) {
