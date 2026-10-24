@@ -404,20 +404,39 @@ async function agendarMensagensUsuario(userId) {
         const nomeGrupoAtual = grupoInfo ? grupoInfo.name : '';
         const grupoIdAtual = grupoInfo ? String(grupoInfo.id) : id;
 
+               await emitirEvento(userId, 'cacador', 'escolhendo', { group_name: nomeGrupoAtual });
+        await pausa();
+
         const resultado = agente.gerarParaGrupo(configAtual.products, hora, nomeGrupoAtual, grupoIdAtual, categoriaForcada, usadosNesteDisparo);
         if (!resultado) continue;
 
+        const infoEvento = {
+          group_name: nomeGrupoAtual,
+          product_id: resultado.produtoId,
+          product_name: resultado.produto,
+          product_platform: resultado.plataforma
+        };
+        await emitirEvento(userId, 'cacador', 'concluido', infoEvento);
+        await emitirEvento(userId, 'redator', 'escrevendo', infoEvento);
+        await pausa();
+        await emitirEvento(userId, 'redator', 'concluido', infoEvento);
+        await emitirEvento(userId, 'mensageiro', 'enviando', infoEvento);
+
         const resultado2 = await enviarMensagem(sock, id, resultado.mensagem, resultado.imageUrl);
         console.log(`   [${userId}] ${resultado2.ok ? '✅ Enviado' : '❌ Falhou'}: ${nomeGrupoAtual}`);
+
+        await emitirEvento(userId, 'mensageiro', resultado2.ok ? 'concluido' : 'erro', infoEvento);
 
         await supabase.from('message_logs').insert({
           user_id: userId,
           group_id: grupoIdAtual,
           group_name: nomeGrupoAtual,
           status: resultado2.ok ? 'enviado' : 'erro',
-          error_message: resultado2.ok ? null : resultado2.error
+          error_message: resultado2.ok ? null : resultado2.error,
+          product_id: resultado.produtoId,
+          product_name: resultado.produto,
+          product_platform: resultado.plataforma
         });
-
         if (resultado2.ok) {
           const { count } = await supabase
             .from('message_logs')
