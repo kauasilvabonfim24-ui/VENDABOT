@@ -103,6 +103,7 @@ const DIAS_SEMANA = {
 };
 
 const SEMPRE_CONVERTE = ['air fryer','robo aspirador','smartwatch','fone bluetooth','carregador','power bank','tenis','perfume','bolsa','mochila','kit ferramentas','caixa de som','impressora','projetor'];
+
 // ─── PLATAFORMAS (Shopee, Mercado Livre, TikTok Shop) ───────────────────────
 // Cada plataforma tem um "selo" na primeira linha da mensagem. Sem promessa
 // de frete/cupom, pra não afirmar nada que possa não ser verdade.
@@ -116,8 +117,10 @@ const PLATAFORMAS = {
     selos: ['🟡 Direto do Mercado Livre', '🤝 Oferta no Mercado Livre', '💛 Achado no Mercado Livre']
   },
   tiktokshop: {
-        ultimaCopy: { geral: null, motoboy: null },
-      ultimaPlataforma: null
+    label: 'TikTok Shop',
+    selos: ['🎵 Direto do TikTok Shop', '🔥 Achado no TikTok Shop', '📱 Tá no TikTok Shop']
+  }
+};
 
 function normalizarPlataforma(valor) {
   const t = normalizar(valor).replace(/[^a-z]/g, '');
@@ -127,6 +130,7 @@ function normalizarPlataforma(valor) {
   if (t.includes('tiktok')) return 'tiktokshop';
   return null;
 }
+
 // ─── HISTÓRICO POR GRUPO (round-robin real, persistido no Supabase) ────────
 // produtosRodada / copysRodada.{geral,motoboy}: Sets com os ids/índices já
 // usados NESTA rodada do grupo. Um item só pode repetir depois que TODO o
@@ -139,7 +143,8 @@ function getHistorico(grupoId) {
       produtosRodada: new Set(),
       copysRodada: { geral: new Set(), motoboy: new Set() },
       ultimoProduto: null,
-      ultimaCopy: { geral: null, motoboy: null }
+      ultimaCopy: { geral: null, motoboy: null },
+      ultimaPlataforma: null
     };
   }
   return historicoPorGrupo[grupoId];
@@ -166,13 +171,11 @@ async function carregarHistoricoInicial() {
     console.error('⚠️  Agente: falha ao carregar histórico do Supabase, começando do zero:', e.message);
   }
 }
-function registrarUso(grupoId, produto) {
-  const h = getHistorico(grupoId);
-  h.produtosRodada.add(produto.id);
-  h.ultimoProduto = produto.id;
-  h.ultimaPlataforma = normalizarPlataforma(produto.platform);
-  persistirHistorico(grupoId); // fire-and-forget, não trava o envio
-}
+
+// Top-level await: como bot.js faz `import * as agente from './agente.js'`,
+// essa linha garante que o histórico já está carregado ANTES do bot.js
+// continuar a execução — sem precisar chamar nada a mais lá.
+await carregarHistoricoInicial();
 
 function persistirHistorico(grupoId) {
   if (!supabase) return;
@@ -191,10 +194,11 @@ function persistirHistorico(grupoId) {
   }).catch(e => console.error(`⚠️  Agente: erro ao salvar histórico do grupo ${grupoId}:`, e.message));
 }
 
-function registrarUso(grupoId, produtoId) {
+function registrarUso(grupoId, produto) {
   const h = getHistorico(grupoId);
-  h.produtosRodada.add(produtoId);
-  h.ultimoProduto = produtoId;
+  h.produtosRodada.add(produto.id);
+  h.ultimoProduto = produto.id;
+  h.ultimaPlataforma = normalizarPlataforma(produto.platform);
   persistirHistorico(grupoId); // fire-and-forget, não trava o envio
 }
 
@@ -231,6 +235,31 @@ function produtoMatchCategoria(produto, categorias, categoriaForcada) {
   if (categoriaForcada) return texto.includes(normalizar(categoriaForcada));
   return categorias.some(c => texto.includes(normalizar(c)));
 }
+
+// Dado um array de produtos já filtrados por uma regra (motoboy, categoria,
+// etc), primeiro tira quem já foi usado NESTE MESMO disparo (outros grupos
+// que já receberam mensagem agora há pouco, no mesmo ciclo do agendamento —
+// essa regra nunca é relaxada). Dentro do que sobrar, tira quem já está na
+// rodada atual do grupo (round-robin). Se isso esvaziar tudo, quer dizer que
+// esse subconjunto específico já deu uma volta completa: libera de novo só
+// os itens desse subconjunto (reseta a rodada apenas pra eles) e retorna o
+// subconjunto inteiro.
+function semRepetir(lista, hist, usadosNesteCiclo) {
+  if (!lista.length) return lista;
+  const foraDoDisparo = lista.filter(p => !usadosNesteCiclo.has(p.id));
+  const candidatos = foraDoDisparo.length ? foraDoDisparo : lista;
+
+  const semRodada = candidatos.filter(p => !hist.produtosRodada.has(p.id));
+  if (semRodada.length) return semRodada;
+
+  // Baralho desse subconjunto acabou — libera de novo, mas sem deixar repetir
+  // o mesmo item que acabou de ser usado (senão dá repetição seguida bem na
+  // hora do reset, ex: ...p3, p3...).
+  candidatos.forEach(p => hist.produtosRodada.delete(p.id));
+  const semORecente = candidatos.filter(p => p.id !== hist.ultimoProduto);
+  return semORecente.length ? semORecente : candidatos;
+}
+
 // ─── RODÍZIO ENTRE PLATAFORMAS ───────────────────────────────────────────────
 // Prefere a plataforma menos usada NESTE disparo; no empate, evita repetir a
 // plataforma da última mensagem desse grupo. Dentro da plataforma, sorteia normal.
@@ -278,7 +307,43 @@ function escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categori
   const categorias = getCategoriasPorContexto(hora, diaSemana);
 
   if (ehMotoboy) {
-   function gerarMensagem(produto, tipo, grupoId, hora) {
+    const motoboys = semRepetir(validos.filter(p => isMotoboy(p)), hist, ciclo);
+    if (motoboys.length) return { produto: sortear(motoboys), tipo: 'motoboy' };
+    const qualquer = semRepetir(validos, hist, ciclo);
+    if (qualquer.length) return { produto: sortear(qualquer), tipo: 'motoboy' };
+  }
+
+  if (categoriaForcada) {
+    const porCategoria = semRepetir(validos.filter(p => produtoMatchCategoria(p, [], categoriaForcada)), hist, ciclo);
+    if (porCategoria.length) return { produto: sortear(porCategoria), tipo: 'geral' };
+  }
+
+  const porHorario = semRepetir(validos.filter(p => produtoMatchCategoria(p, categorias, null)), hist, ciclo);
+  if (porHorario.length) return { produto: sortear(porHorario), tipo: 'geral' };
+
+  const disponiveis = semRepetir(validos, hist, ciclo);
+  return { produto: sortear(disponiveis), tipo: 'geral' };
+}
+
+// ─── ESCOLHER COPY SEM REPETIR (round-robin por tipo geral/motoboy) ────────
+function escolherCopy(copys, grupoId, tipo) {
+  const hist = getHistorico(grupoId);
+  const rodada = hist.copysRodada[tipo];
+  let disponiveis = copys.map((_, i) => i).filter(i => !rodada.has(i));
+  if (!disponiveis.length) {
+    rodada.clear(); // baralho de copys acabou, libera de novo
+    const ultima = hist.ultimaCopy[tipo];
+    const semARecente = copys.map((_, i) => i).filter(i => i !== ultima);
+    disponiveis = semARecente.length ? semARecente : copys.map((_, i) => i);
+  }
+  const idx = disponiveis[Math.floor(Math.random() * disponiveis.length)];
+  rodada.add(idx);
+  hist.ultimaCopy[tipo] = idx;
+  return idx;
+}
+
+// ─── GERAR MENSAGEM ───────────────────────────────────────────────────────────
+function gerarMensagem(produto, tipo, grupoId, hora) {
   const desconto = calcularDesconto(produto.oldPrice, produto.price);
   const precoAtual = parseFloat(String(produto.price).replace(',', '.')).toFixed(2).replace('.', ',');
   const precoAntigo = parseFloat(String(produto.oldPrice).replace(',', '.')).toFixed(2).replace('.', ',');
@@ -314,68 +379,6 @@ function escolherProduto(produtos, hora, diaSemana, nomeGrupo, grupoId, categori
     plataformaLabel: info ? info.label : null
   };
 }
-  const categorias = getCategoriasPorContexto(hora, diaSemana);
-
-  if (ehMotoboy) {
-    const motoboys = semRepetir(validos.filter(p => isMotoboy(p)), hist, ciclo);
-      console.log(`   🛍️  Plataforma: ${msg.plataformaLabel || 'não informada'}`);
-    if (motoboys.length) return { produto: motoboys[Math.floor(Math.random() * motoboys.length)], tipo: 'motoboy' };
-    const qualquer = semRepetir(validos, hist, ciclo);
-    if (qualquer.length) return { produto: qualquer[Math.floor(Math.random() * qualquer.length)], tipo: 'motoboy' };
-  }
-
-  if (categoriaForcada) {
-    const porCategoria = semRepetir(validos.filter(p => produtoMatchCategoria(p, [], categoriaForcada)), hist, ciclo);
-    if (porCategoria.length) return { produto: porCategoria[Math.floor(Math.random() * porCategoria.length)], tipo: 'geral' };
-  }
-
-  const porHorario = semRepetir(validos.filter(p => produtoMatchCategoria(p, categorias, null)), hist, ciclo);
-  if (porHorario.length) return { produto: porHorario[Math.floor(Math.random() * porHorario.length)], tipo: 'geral' };
-
-  const disponiveis = semRepetir(validos, hist, ciclo);
-  return { produto: disponiveis[Math.floor(Math.random() * disponiveis.length)], tipo: 'geral' };
-}
-
-// ─── ESCOLHER COPY SEM REPETIR (round-robin por tipo geral/motoboy) ────────
-function escolherCopy(copys, grupoId, tipo) {
-  const hist = getHistorico(grupoId);
-  const rodada = hist.copysRodada[tipo];
-  let disponiveis = copys.map((_, i) => i).filter(i => !rodada.has(i));
-  if (!disponiveis.length) {
-    rodada.clear(); // baralho de copys acabou, libera de novo
-    const ultima = hist.ultimaCopy[tipo];
-    const semARecente = copys.map((_, i) => i).filter(i => i !== ultima);
-    disponiveis = semARecente.length ? semARecente : copys.map((_, i) => i);
-  }
-  const idx = disponiveis[Math.floor(Math.random() * disponiveis.length)];
-  rodada.add(idx);
-  hist.ultimaCopy[tipo] = idx;
-  return idx;
-}
-
-// ─── GERAR MENSAGEM ───────────────────────────────────────────────────────────
-function gerarMensagem(produto, tipo, grupoId, hora) {
-  const desconto = calcularDesconto(produto.oldPrice, produto.price);
-  const precoAtual = parseFloat(String(produto.price).replace(',', '.')).toFixed(2).replace('.', ',');
-  const precoAntigo = parseFloat(String(produto.oldPrice).replace(',', '.')).toFixed(2).replace('.', ',');
-  const descontoTag = desconto > 0 ? ` (${desconto}% OFF)` : '';
-
-  const copys = tipo === 'motoboy' ? COPYS_MOTOBOY : COPYS_GERAIS;
-  const tipoCopy = tipo === 'motoboy' ? 'motoboy' : 'geral';
-  const idx = escolherCopy(copys, grupoId, tipoCopy);
-
-  registrarUso(grupoId, produto.id); // marca produto e persiste (produto + copy juntos, já marcados acima)
-
-  const mensagem = copys[idx]
-    .replace(/{SAUDACAO}/g, getSaudacao(hora))
-    .replace(/{NOME}/g, produto.name)
-    .replace(/{PRECO_ANTIGO}/g, precoAntigo)
-    .replace(/{PRECO_ATUAL}/g, precoAtual)
-    .replace(/{DESCONTO_TAG}/g, descontoTag)
-    .replace(/{LINK}/g, produto.link);
-
-  return { mensagem, imageUrl: produto.imageUrl || null, produto: produto.name, produtoId: produto.id, desconto };
-}
 
 // ─── FUNÇÃO PRINCIPAL ───────────────────────────────────────────────────────
 function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada, usadosNesteCiclo) {
@@ -394,6 +397,7 @@ function gerarParaGrupo(produtos, hora, nomeGrupo, grupoId, categoriaForcada, us
   const dias = ['Dom','Seg','Ter','Qua','Qui','Sex','Sab'];
   console.log(`🧠 Agente → Grupo: "${nomeGrupo}"`);
   console.log(`   📦 Produto: ${msg.produto}`);
+  console.log(`   🛍️  Plataforma: ${msg.plataformaLabel || 'não informada'}`);
   console.log(`   💰 Desconto: ${msg.desconto}%`);
   console.log(`   🏷️  Tipo copy: ${resultado.tipo}`);
   console.log(`   🕐 ${hora}h | ${dias[diaSemana]}${categoriaForcada ? ` | Categoria: ${categoriaForcada}` : ''}`);
